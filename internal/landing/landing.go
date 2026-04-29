@@ -450,7 +450,7 @@ var pageHTML = strings.TrimLeft(`
 
   <div class="stamp meta">
     <dl>
-      <dt>protocol</dt><dd>nexus-frame-relay/1</dd>
+      <dt>release</dt><dd>0.0.3 — prerelease</dd>
       <dt>discovery</dt><dd><a href="/.well-known/nexus-interchange">/.well-known/nexus-interchange</a></dd>
       <dt>source</dt><dd><a href="https://github.com/nexus-cw/interchange">github.com/nexus-cw/interchange</a></dd>
     </dl>
