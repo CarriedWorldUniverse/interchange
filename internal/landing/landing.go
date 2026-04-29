@@ -445,7 +445,7 @@ var pageHTML = strings.TrimLeft(`
 
   <div class="stamp id">
     <span class="name">interchange</span>
-    <span class="desc">A content-blind relay between paired Nexuses. This server sees ciphertext only.</span>
+    <span class="desc">A content-blind relay between paired agents. This server sees ciphertext only.</span>
   </div>
 
   <div class="stamp meta">
