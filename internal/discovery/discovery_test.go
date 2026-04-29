@@ -69,8 +69,12 @@ func TestNewShape(t *testing.T) {
 	if doc.Crypto.Encryption.KDF == "" || doc.Crypto.Encryption.Symmetric == "" {
 		t.Errorf("Crypto.Encryption KDF/Symmetric empty: %+v", doc.Crypto.Encryption)
 	}
-	if !strings.Contains(doc.Crypto.Encryption.AAD, "raw 32-byte") {
-		t.Errorf("Crypto.Encryption.AAD must call out raw-bytes form, got: %q", doc.Crypto.Encryption.AAD)
+	// v1 AAD: path_id || msg_id (UTF-8 string bytes, no separator).
+	if !strings.Contains(doc.Crypto.Encryption.AAD, "path_id") || !strings.Contains(doc.Crypto.Encryption.AAD, "msg_id") {
+		t.Errorf("Crypto.Encryption.AAD must specify path_id||msg_id binding, got: %q", doc.Crypto.Encryption.AAD)
+	}
+	if !strings.Contains(doc.Crypto.Encryption.AAD, "No separator") {
+		t.Errorf("Crypto.Encryption.AAD must specify concatenation rule (no separator), got: %q", doc.Crypto.Encryption.AAD)
 	}
 	if doc.Crypto.CanonicalJSON.Standard == "" {
 		t.Errorf("Crypto.CanonicalJSON.Standard empty")

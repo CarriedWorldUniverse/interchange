@@ -249,7 +249,7 @@ Unauthenticated, public, returned in full on every GET. A new Nexus (or AI agent
       "kdf": "HKDF-SHA256 over ECDH shared secret → 32-byte symmetric key",
       "symmetric": "AES-256-GCM",
       "nonce": "96-bit random nonce, prepended to ciphertext",
-      "aad": "v1 convention: AAD is nil (empty) on both encrypt and decrypt. The earlier 'sha256(ciphertext)' formulation is unimplementable — the sender cannot know the ciphertext digest before producing the ciphertext, and binding ct→ct via AAD is circular. Outer-envelope integrity is provided by the explicit ciphertext_sha256 field plus the AEAD GCM tag. Implementations MUST pass nil AAD to Channel.encryptBody / Channel.decryptBody; spec-level AAD binding is deferred to v2."
+      "aad": "v1 convention: AAD = UTF-8 string bytes of path_id concatenated with UTF-8 string bytes of msg_id. No separator, no length prefix. Both values are ASCII so UTF-8 == raw string bytes. Implementations MUST pass these bytes as AEAD AAD on both encrypt and decrypt. This binds the AEAD-tagged ciphertext to the specific path and message — a ciphertext extracted from one envelope cannot be decrypted against a different path_id or msg_id. The earlier 'sha256(ciphertext)' formulation was unimplementable (circular); path_id||msg_id expresses the same intent in a way both sides can compute pre-encryption."
     },
     "canonical_json": {
       "standard": "RFC 8785 (JSON Canonicalization Scheme / JCS)",
@@ -392,7 +392,11 @@ X-Nexus-Signature: <base64url( sig_alg.sign( canonicalJSON(outer) ) )>
 
 AEAD-sealed with the paired channel's symmetric key.
 
-**AAD binding (v1).** AAD is nil (empty) on both encrypt and decrypt. The earlier formulation — AAD = raw SHA-256 of the ciphertext — is unimplementable: the sender cannot compute the ciphertext digest before producing the ciphertext, and binding ct→ct via AAD is circular. Outer-envelope integrity is preserved by two existing mechanisms: the explicit `ciphertext_sha256` field in the outer envelope (verified by recipients before decrypt), and the AEAD GCM authentication tag (which already binds ciphertext integrity into the encrypted payload itself). Implementations MUST pass nil AAD to `paired.encryptBody` / `paired.decryptBody`. A non-circular AAD scheme (e.g. binding outer-envelope metadata that is known *before* encryption — pathId, msg_id, ts) is deferred to v2.
+**AAD binding (v1).** AAD = UTF-8 string bytes of `path_id` concatenated with UTF-8 string bytes of `msg_id`. No separator, no length prefix. Both `path_id` and `msg_id` are ASCII-safe in their canonical form (path_id = `nxc_<base64url>`, msg_id = UUIDv7), so UTF-8 encoding is byte-identical to their raw string form. Implementations MUST pass these concatenated bytes as AEAD AAD on both encrypt and decrypt; mismatch causes authentication failure at decrypt with no useful diagnostic.
+
+This binds the AEAD-tagged ciphertext to the specific path and message it was created for. A ciphertext extracted from one envelope cannot be successfully decrypted against a different `path_id` or `msg_id` — the relay cannot replay or substitute envelopes across paths even at the AEAD layer. Outer-envelope integrity layer (signed canonical JSON including `ciphertext_sha256`) defends against tampering with the routing fields; AEAD AAD defends against valid-but-misrouted ciphertexts.
+
+The earlier spec text — AAD = SHA-256 of the ciphertext — is unimplementable: the sender cannot compute the ciphertext digest before producing the ciphertext, and binding ct→ct via AAD is circular. That formulation was an aspirational instinct that never had a working implementation; v1 uses `path_id || msg_id` as the proper expression of the same intent (bind ciphertext to its routing context, pre-computable by both sides).
 
 ```json
 {
@@ -529,7 +533,8 @@ Unauthenticated. `200 ok`.
 ### Send (outbound, autonomous)
 
 ```
-draft inner → paired.encryptBody(inner, aad=nil)
+draft inner → aad = utf8(path_id) || utf8(msg_id)
+           → paired.encryptBody(inner, aad)
            → build outer with ciphertext + ciphertext_sha256
            → paired.sign(canonical(outer))
            → PUT /mailbox/<pathId> with X-Nexus-Signature
@@ -547,7 +552,8 @@ GET /mailbox/<pathId>?since=<cursor> with signed URL
       verify sig via paired.verify
       if seen(msg_id): drop
       else:
-        paired.decryptBody(ciphertext, aad=nil) → inner
+        aad = utf8(path_id) || utf8(msg_id)
+        paired.decryptBody(ciphertext, aad) → inner
         validate content_type ∈ allowlist, body length ≤ max
         apply Content Handling wrapping when presenting to aspects or the Frame (rule 1)
         insert local inbox, mark seen

@@ -182,7 +182,7 @@ func New(interchangeID string) Document {
 				KDF:       "HKDF-SHA256 over ECDH shared secret → 32-byte symmetric key",
 				Symmetric: "AES-256-GCM",
 				Nonce:     "96-bit random nonce, prepended to ciphertext",
-				AAD:       "raw 32-byte SHA-256 digest of ciphertext bytes (same bytes whose hex appears as ciphertext_sha256 in outer envelope). Pass as raw bytes, not hex, not base64.",
+				AAD:       "UTF-8 string bytes of `path_id` concatenated with UTF-8 string bytes of `msg_id`. No separator, no length prefix. path_id and msg_id are ASCII so UTF-8 == raw string bytes. Pass the concatenated bytes as the AEAD AAD on both encrypt and decrypt. This binds the AEAD-tagged ciphertext to the specific path and message — replaying to a different path_id or msg_id fails authentication at decrypt. Both sides know these values before encrypting.",
 			},
 			CanonicalJSON: CanonicalJSON{
 				Standard:      "RFC 8785 (JSON Canonicalization Scheme / JCS)",

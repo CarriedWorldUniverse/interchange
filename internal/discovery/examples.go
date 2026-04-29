@@ -21,6 +21,7 @@ type Examples struct {
 	OuterEnvelope   ExampleOuter       `json:"outer_envelope"`
 	InnerEnvelope   ExampleInner       `json:"inner_envelope"`
 	PathIDDerivation ExamplePathID     `json:"path_id_derivation"`
+	AEADVector      AEADExample        `json:"aead_vector"`
 }
 
 type ExampleTestKeys struct {
@@ -159,14 +160,16 @@ func buildExamples() Examples {
 			},
 			Encryption: ExampleEncryption{
 				Note: "1) Canonicalize the plaintext to bytes per RFC 8785. " +
-					"2) Encrypt with AES-256-GCM using HKDF-SHA256(ECDH-shared-secret) as the key. " +
-					"3) Prepend the 12-byte nonce to the ciphertext. " +
-					"4) AAD = raw 32-byte SHA-256 of the (nonce||ciphertext) bytes about to appear in the outer envelope's ciphertext field, NOT base64 NOT hex.",
+					"2) Compute AAD = UTF-8 string bytes of (path_id || msg_id), no separator. Both values are ASCII so UTF-8 == raw string bytes. " +
+					"3) Encrypt with AES-256-GCM using HKDF-SHA256(ECDH-shared-secret) as the key, the 12-byte random nonce, and the AAD from step 2. " +
+					"4) Prepend the nonce to the GCM output (ciphertext||tag). The result is the bytes that go into the outer envelope's `ciphertext` field (then base64url-encoded for transport).",
 				NonceHex:        "000102030405060708090a0b",
-				AADNote:         "AAD is bound to the message body itself by hashing the very bytes that will become the outer.ciphertext field. This prevents an attacker from substituting one valid ciphertext for another between two paired peers.",
-				AlgorithmReminder: "AES-256-GCM, 12-byte nonce prepended to ciphertext, 16-byte auth tag is implicit in GCM output.",
+				AADNote:         "AAD = path_id || msg_id (UTF-8 bytes, no separator). For the values in this example: path_id='" + examplePathID + "' (47 chars) || msg_id='01979b0a-c0de-7eef-a000-000000000001' (36 chars) = 83 bytes. Binding the AEAD output to (path, message) means a ciphertext extracted from one envelope cannot be successfully decrypted against a different path_id or msg_id — authentication fails at decrypt time.",
+				AlgorithmReminder: "AES-256-GCM, 12-byte nonce prepended to ciphertext, 16-byte auth tag is the trailing 16 bytes of the GCM output.",
 			},
 		},
+
+		AEADVector: exampleAEAD,
 
 		PathIDDerivation: ExamplePathID{
 			Note: "path_id is computed identically by both peers and the interchange. " +
