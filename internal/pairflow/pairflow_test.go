@@ -53,23 +53,11 @@ func signedHalf(nexusID, endpoint string, ts time.Time, pub ed25519.PublicKey, p
 		Nonce:    nonce,
 		Ts:       tsStr,
 	}
-	h.SelfSig = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, canonicalBytes(h)))
+	// Existing tests sign with the v1 preimage (no dh material). v2-shape
+	// signing is exercised by dedicated v2 tests added below.
+	h.SelfSig = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, canonicalBytesV1(h)))
 	h.pubkeyRaw = pub
 	return h
-}
-
-// halfToWire drops the private pubkeyRaw field for JSON encoding as
-// what a real client would submit over the wire.
-func halfToWire(h half) map[string]string {
-	return map[string]string{
-		"nexus_id": h.NexusID,
-		"sig_alg":  h.SigAlg,
-		"pubkey":   h.Pubkey,
-		"endpoint": h.Endpoint,
-		"nonce":    h.Nonce,
-		"ts":       h.Ts,
-		"self_sig": h.SelfSig,
-	}
 }
 
 // -------- createRequest tests --------
@@ -515,11 +503,10 @@ func TestComputePathIDPrefix(t *testing.T) {
 
 // -------- canonicalBytes interop test --------
 
-// TestCanonicalBytesFormat pins the exact byte layout the self-sig is
-// computed over. v3 spec §Components.2 Pairing.self_sig_canonical is
-// the contract; divergence here silently breaks interop with any peer
-// that canonicalises differently.
-func TestCanonicalBytesFormat(t *testing.T) {
+// TestCanonicalBytesV1Format pins the deprecated v1 preimage byte
+// layout. Held for back-compat verification of v1 halves during the
+// migration window.
+func TestCanonicalBytesV1Format(t *testing.T) {
 	h := half{
 		NexusID:  "bob",
 		SigAlg:   "ed25519",
@@ -528,14 +515,183 @@ func TestCanonicalBytesFormat(t *testing.T) {
 		Nonce:    "noncebytes",
 		Ts:       "2026-04-25T12:00:00Z",
 	}
-	got := string(canonicalBytes(h))
+	got := string(canonicalBytesV1(h))
 	want := "v1\nbob\ned25519\nabcdef\nhttps://bob\nnoncebytes\n2026-04-25T12:00:00Z"
 	if got != want {
-		t.Errorf("canonical mismatch.\ngot:  %q\nwant: %q", got, want)
+		t.Errorf("v1 canonical mismatch.\ngot:  %q\nwant: %q", got, want)
 	}
-	// No trailing newline.
 	if strings.HasSuffix(got, "\n") {
-		t.Errorf("trailing newline in canonical bytes")
+		t.Errorf("trailing newline in v1 canonical bytes")
+	}
+}
+
+// TestCanonicalBytesV2Format pins the current v2 preimage layout.
+// dh_alg + dh_pubkey appear between pubkey and endpoint, ensuring
+// substitution attacks on the ECDH key fail signature verification.
+func TestCanonicalBytesV2Format(t *testing.T) {
+	h := half{
+		NexusID:  "bob",
+		SigAlg:   "ed25519",
+		Pubkey:   "abcdef",
+		DhAlg:    "P-256",
+		DhPubkey: "dhkey-b64u",
+		Endpoint: "https://bob",
+		Nonce:    "noncebytes",
+		Ts:       "2026-04-25T12:00:00Z",
+	}
+	got := string(canonicalBytesV2(h))
+	want := "v2\nbob\ned25519\nabcdef\nP-256\ndhkey-b64u\nhttps://bob\nnoncebytes\n2026-04-25T12:00:00Z"
+	if got != want {
+		t.Errorf("v2 canonical mismatch.\ngot:  %q\nwant: %q", got, want)
+	}
+	if strings.HasSuffix(got, "\n") {
+		t.Errorf("trailing newline in v2 canonical bytes")
+	}
+}
+
+// signedHalfV2 builds a v2-shape half with dh_alg + dh_pubkey, signed
+// over the v2 preimage. Used to seed approve flow tests.
+func signedHalfV2(nexusID, endpoint, dhPubB64u string, ts time.Time, pub ed25519.PublicKey, priv ed25519.PrivateKey) half {
+	pubB64 := base64.RawURLEncoding.EncodeToString(pub)
+	nonce := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0xab}, 16))
+	tsStr := ts.Format("2006-01-02T15:04:05Z")
+	h := half{
+		NexusID:  nexusID,
+		SigAlg:   "ed25519",
+		Pubkey:   pubB64,
+		DhAlg:    "P-256",
+		DhPubkey: dhPubB64u,
+		Endpoint: endpoint,
+		Nonce:    nonce,
+		Ts:       tsStr,
+	}
+	h.SelfSig = base64.RawURLEncoding.EncodeToString(ed25519.Sign(priv, canonicalBytesV2(h)))
+	h.pubkeyRaw = pub
+	return h
+}
+
+func TestCreateRequestAcceptsV2Half(t *testing.T) {
+	h, _ := fixture(t)
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	req := signedHalfV2("bob", "https://bob.example", "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0", h.now(), pub, priv)
+	body, _ := json.Marshal(map[string]any{
+		"target_nexus_id": "alice",
+		"requester":       halfToWire(req),
+	})
+	rr := doPublic(t, h, http.MethodPost, "/pair/request", body)
+	if rr.Code != http.StatusCreated {
+		t.Errorf("v2 half should be accepted: status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApproveResponseIncludesRequesterHalf(t *testing.T) {
+	h, _ := fixture(t)
+	// Seed a v2 pending request.
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	req := signedHalfV2("requester", "https://r.example", "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0", h.now(), pub, priv)
+	body, _ := json.Marshal(map[string]any{
+		"target_nexus_id": "owner",
+		"requester":       halfToWire(req),
+	})
+	rr := doPublic(t, h, http.MethodPost, "/pair/request", body)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("seed create: %d %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &created)
+	createdID, _ := created["request_id"].(string)
+	// Approve with a v2 owner half.
+	oPub, oPriv, _ := ed25519.GenerateKey(nil)
+	owner := signedHalfV2("owner", "https://o.example", "BEW5qtWLGXyJSYGxfkYHDWiyZmJ8tlLQsG1y0JjWFcuPm3iJxDuE6wM83AXmr67nOalMCkLC_oDCwRngkSNmvXU", h.now(), oPub, oPriv)
+	abody, _ := json.Marshal(map[string]any{"owner": halfToWire(owner)})
+	ar := doOwner(t, h, http.MethodPost, "/pair/requests/"+createdID+"/approve", abody)
+	if ar.Code != http.StatusOK {
+		t.Fatalf("approve failed: %d %s", ar.Code, ar.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(ar.Body.Bytes(), &resp)
+	rh, ok := resp["requester_half"].(map[string]any)
+	if !ok {
+		t.Fatalf("approve response missing requester_half: %s", ar.Body.String())
+	}
+	if rh["dh_pubkey"] != "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0" {
+		t.Errorf("requester_half.dh_pubkey unexpected: %v", rh["dh_pubkey"])
+	}
+	if rh["dh_alg"] != "P-256" {
+		t.Errorf("requester_half.dh_alg = %v, want P-256", rh["dh_alg"])
+	}
+}
+
+func TestStatusResponseIncludesOwnerHalfWhenApproved(t *testing.T) {
+	h, _ := fixture(t)
+	// Same setup as approve test, then poll status.
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	req := signedHalfV2("requester", "https://r.example", "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0", h.now(), pub, priv)
+	body, _ := json.Marshal(map[string]any{
+		"target_nexus_id": "owner",
+		"requester":       halfToWire(req),
+	})
+	rr := doPublic(t, h, http.MethodPost, "/pair/request", body)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("seed create: %d %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]any
+	_ = json.Unmarshal(rr.Body.Bytes(), &created)
+	createdID, _ := created["request_id"].(string)
+	oPub, oPriv, _ := ed25519.GenerateKey(nil)
+	owner := signedHalfV2("owner", "https://o.example", "BEW5qtWLGXyJSYGxfkYHDWiyZmJ8tlLQsG1y0JjWFcuPm3iJxDuE6wM83AXmr67nOalMCkLC_oDCwRngkSNmvXU", h.now(), oPub, oPriv)
+	abody, _ := json.Marshal(map[string]any{"owner": halfToWire(owner)})
+	doOwner(t, h, http.MethodPost, "/pair/requests/"+createdID+"/approve", abody)
+
+	// Now poll status as the public requester.
+	sr := doPublic(t, h, http.MethodGet, "/pair/requests/"+createdID, nil)
+	if sr.Code != http.StatusOK {
+		t.Fatalf("status fetch failed: %d %s", sr.Code, sr.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(sr.Body.Bytes(), &resp)
+	if resp["status"] != "approved" {
+		t.Fatalf("status = %v, want approved", resp["status"])
+	}
+	oh, ok := resp["owner_half"].(map[string]any)
+	if !ok {
+		t.Fatalf("status response missing owner_half: %s", sr.Body.String())
+	}
+	if oh["dh_pubkey"] != "BEW5qtWLGXyJSYGxfkYHDWiyZmJ8tlLQsG1y0JjWFcuPm3iJxDuE6wM83AXmr67nOalMCkLC_oDCwRngkSNmvXU" {
+		t.Errorf("owner_half.dh_pubkey unexpected: %v", oh["dh_pubkey"])
+	}
+}
+
+// TestVerifySelfSigRejectsV1WhenDhPubkeyPresent — security-critical:
+// a half that carries dh_pubkey but signs with the v1 preimage leaves
+// the ECDH key out of signature coverage. We MUST reject that case to
+// prevent substitution.
+func TestVerifySelfSigRejectsV1WhenDhPubkeyPresent(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	pubB64 := base64.RawURLEncoding.EncodeToString(pub)
+	h := half{
+		NexusID:   "alice",
+		SigAlg:    "ed25519",
+		Pubkey:    pubB64,
+		DhAlg:     "P-256",
+		DhPubkey:  "victim-pubkey-b64u",
+		Endpoint:  "https://alice",
+		Nonce:     "AAECAwQFBgcICQoLDA0ODw",
+		Ts:        time.Now().UTC().Format("2006-01-02T15:04:05Z"),
+		pubkeyRaw: pub,
+	}
+	// Sign with v1 preimage (which excludes DhPubkey) — attacker could
+	// have substituted DhPubkey without invalidating this signature.
+	v1Sig := ed25519.Sign(priv, canonicalBytesV1(h))
+	h.SelfSig = base64.RawURLEncoding.EncodeToString(v1Sig)
+	if verifySelfSig(h) {
+		t.Errorf("verifySelfSig accepted v1 sig over a half with dh_pubkey — substitution attack would succeed")
+	}
+	// Now sign with v2 preimage — must verify.
+	v2Sig := ed25519.Sign(priv, canonicalBytesV2(h))
+	h.SelfSig = base64.RawURLEncoding.EncodeToString(v2Sig)
+	if !verifySelfSig(h) {
+		t.Errorf("verifySelfSig rejected v2 sig over a v2-shape half")
 	}
 }
 

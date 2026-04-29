@@ -158,10 +158,19 @@ func (h *Handler) dispatchOwner(w http.ResponseWriter, r *http.Request) {
 }
 
 // half is the parsed form of a requester-or-owner submission.
+//
+// dh_alg + dh_pubkey are v2 additions (optional in the parser to keep
+// backwards compatibility with v1 callers during the transition). When
+// present, they are covered by the v2 self-sig preimage. The relay is
+// curve-agnostic — it does not enforce that dh_alg matches between
+// requester and owner; clients (casket.Channel.Pair) detect mismatches
+// at local activation with a clearer error.
 type half struct {
 	NexusID   string `json:"nexus_id"`
 	SigAlg    string `json:"sig_alg"`
 	Pubkey    string `json:"pubkey"`    // base64url wire-format Ed25519 (32 bytes raw)
+	DhAlg     string `json:"dh_alg,omitempty"`     // "P-256" or "X25519" — v2
+	DhPubkey  string `json:"dh_pubkey,omitempty"`  // base64url ECDH pubkey — v2
 	Endpoint  string `json:"endpoint"`  // optional
 	Nonce     string `json:"nonce"`     // base64url 16+ bytes
 	Ts        string `json:"ts"`        // ISO 8601 UTC
@@ -197,13 +206,31 @@ func parseHalf(in half) (half, string) {
 		return half{}, "pubkey_length"
 	}
 	in.pubkeyRaw = pub
+
+	// v2: if dh_alg or dh_pubkey is present, validate basic shape. Both
+	// must be present together. Curve choice (P-256 vs X25519) is not
+	// enforced against any allowlist here — relay stays curve-agnostic.
+	if in.DhAlg != "" || in.DhPubkey != "" {
+		if in.DhAlg == "" || in.DhPubkey == "" {
+			return half{}, "dh_alg_or_dh_pubkey_missing"
+		}
+		if len(in.DhAlg) > 32 {
+			return half{}, "dh_alg_too_long"
+		}
+		if len(in.DhPubkey) > 256 {
+			return half{}, "dh_pubkey_too_long"
+		}
+		if _, err := decodeB64URL(in.DhPubkey); err != nil {
+			return half{}, "dh_pubkey_not_base64url"
+		}
+	}
 	return in, ""
 }
 
-// canonicalBytes builds the line-oriented UTF-8 self-sig preimage per
-// v3 spec §Components.2 Pairing.self_sig_canonical. Fields joined by
-// "\n" (LF), no trailing newline, literal "v1" prefix.
-func canonicalBytes(h half) []byte {
+// canonicalBytesV1 builds the deprecated v1 self-sig preimage:
+// "v1\n<nexus_id>\n<sig_alg>\n<pubkey>\n<endpoint>\n<nonce>\n<ts>",
+// no trailing newline. Accepted during the v1→v2 transition.
+func canonicalBytesV1(h half) []byte {
 	return []byte(strings.Join([]string{
 		"v1",
 		h.NexusID,
@@ -215,14 +242,48 @@ func canonicalBytes(h half) []byte {
 	}, "\n"))
 }
 
-// verifySelfSig checks the half's self_sig against its own pubkey. The
-// half's self-signature proves key possession.
+// canonicalBytesV2 builds the current v2 self-sig preimage:
+// "v2\n<nexus_id>\n<sig_alg>\n<pubkey>\n<dh_alg>\n<dh_pubkey>\n<endpoint>\n<nonce>\n<ts>",
+// no trailing newline. Includes ECDH material under signature coverage
+// so a relay or wire observer cannot substitute dh_pubkey without
+// invalidating the signature.
+func canonicalBytesV2(h half) []byte {
+	return []byte(strings.Join([]string{
+		"v2",
+		h.NexusID,
+		h.SigAlg,
+		h.Pubkey,
+		h.DhAlg,
+		h.DhPubkey,
+		h.Endpoint,
+		h.Nonce,
+		h.Ts,
+	}, "\n"))
+}
+
+// verifySelfSig checks the half's self_sig against its own pubkey,
+// trying the v2 preimage first when dh_alg is set. If the v2 verify
+// fails (or dh_alg is empty), falls back to v1. New halves should be
+// signed with v2; v1 is accepted only during the migration window.
+//
+// Important: a half that carries dh_alg + dh_pubkey but signs with the
+// v1 preimage leaves the dh_pubkey out of signature coverage — open to
+// substitution. We REJECT that case explicitly: if dh_pubkey is present
+// the signature MUST verify against v2 (and only v2). Otherwise we
+// would silently accept a half whose ECDH key is unsigned.
 func verifySelfSig(h half) bool {
 	sig, err := decodeB64URL(h.SelfSig)
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return false
 	}
-	return ed25519.Verify(ed25519.PublicKey(h.pubkeyRaw), canonicalBytes(h), sig)
+	pub := ed25519.PublicKey(h.pubkeyRaw)
+
+	if h.DhPubkey != "" {
+		// v2 mandatory: dh_pubkey must be in signature coverage.
+		return ed25519.Verify(pub, canonicalBytesV2(h), sig)
+	}
+	// v1 only: legacy half without ECDH material.
+	return ed25519.Verify(pub, canonicalBytesV1(h), sig)
 }
 
 // tsInWindow enforces the ±5min replay window.
@@ -330,7 +391,41 @@ func (h *Handler) getRequestStatus(w http.ResponseWriter, r *http.Request, reque
 	if req.PathID != "" {
 		resp["path_id"] = req.PathID
 	}
+	// v2: when status=approved, surface the OWNER's half so the
+	// requester can locally instantiate a paired channel without an
+	// out-of-band PairingToken exchange. The owner's half was stored
+	// at approve-time in OwnerJSON. Stays absent for pending/denied/
+	// expired states.
+	if req.Status == storage.StatusApproved && req.OwnerJSON != "" {
+		var owner half
+		if err := json.Unmarshal([]byte(req.OwnerJSON), &owner); err == nil {
+			resp["owner_half"] = halfToWire(owner)
+		}
+	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// halfToWire returns the public-fields-only view of a half suitable for
+// surfacing in API responses. Strips the internal pubkeyRaw scratch
+// field; preserves all wire-shape fields (including v2 dh_alg + dh_pubkey
+// when set).
+func halfToWire(h half) map[string]string {
+	out := map[string]string{
+		"nexus_id": h.NexusID,
+		"sig_alg":  h.SigAlg,
+		"pubkey":   h.Pubkey,
+		"endpoint": h.Endpoint,
+		"nonce":    h.Nonce,
+		"ts":       h.Ts,
+		"self_sig": h.SelfSig,
+	}
+	if h.DhAlg != "" {
+		out["dh_alg"] = h.DhAlg
+	}
+	if h.DhPubkey != "" {
+		out["dh_pubkey"] = h.DhPubkey
+	}
+	return out
 }
 
 // listPending handles GET /pair/requests?status=pending (owner only).
@@ -418,9 +513,10 @@ func (h *Handler) approve(w http.ResponseWriter, r *http.Request, requestID stri
 				existing, gerr := h.Store.GetPair(r.Context(), req.PathID)
 				if gerr == nil && existing.OwnerPubkey == owner.Pubkey {
 					writeJSON(w, http.StatusOK, map[string]any{
-						"request_id": requestID,
-						"status":     "approved",
-						"path_id":    req.PathID,
+						"request_id":     requestID,
+						"status":         "approved",
+						"path_id":        req.PathID,
+						"requester_half": parsedRequesterHalf(req.RequesterJSON),
 					})
 					return
 				}
@@ -488,7 +584,10 @@ func (h *Handler) approve(w http.ResponseWriter, r *http.Request, requestID stri
 			// Update pair request to approved to keep state consistent.
 			_ = h.Store.UpdatePairRequestStatus(r.Context(), requestID, storage.StatusApproved, string(raw), pathID)
 			writeJSON(w, http.StatusOK, map[string]any{
-				"request_id": requestID, "status": "approved", "path_id": pathID,
+				"request_id":     requestID,
+				"status":         "approved",
+				"path_id":        pathID,
+				"requester_half": halfToWire(requester),
 			})
 			return
 		}
@@ -515,10 +614,23 @@ func (h *Handler) approve(w http.ResponseWriter, r *http.Request, requestID stri
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"request_id": requestID,
-		"status":     "approved",
-		"path_id":    pathID,
+		"request_id":     requestID,
+		"status":         "approved",
+		"path_id":        pathID,
+		"requester_half": halfToWire(requester),
 	})
+}
+
+// parsedRequesterHalf is a helper that decodes the stored requester
+// JSON to a wire-shape map. Returns an empty map on parse failure
+// (the surrounding response is still useful even if the half is
+// recovered as empty — the requester can fetch via status poll).
+func parsedRequesterHalf(stored string) map[string]string {
+	var h half
+	if err := json.Unmarshal([]byte(stored), &h); err != nil {
+		return map[string]string{}
+	}
+	return halfToWire(h)
 }
 
 // deny handles POST /pair/requests/:id/deny.
@@ -577,10 +689,16 @@ func bytesLess(a, b []byte) bool {
 // serializeHalf JSON-encodes the half back into the stored-record form,
 // stripping the private pubkeyRaw cache field.
 func serializeHalf(h half) ([]byte, error) {
+	// Persist all wire-shape fields, including v2 ECDH material when
+	// present. Storage holds the canonical form so it can be returned
+	// later as `requester_half` / `owner_half` in approve/poll
+	// responses without re-deriving from the raw request body.
 	wire := struct {
 		NexusID  string `json:"nexus_id"`
 		SigAlg   string `json:"sig_alg"`
 		Pubkey   string `json:"pubkey"`
+		DhAlg    string `json:"dh_alg,omitempty"`
+		DhPubkey string `json:"dh_pubkey,omitempty"`
 		Endpoint string `json:"endpoint"`
 		Nonce    string `json:"nonce"`
 		Ts       string `json:"ts"`
@@ -589,6 +707,8 @@ func serializeHalf(h half) ([]byte, error) {
 		NexusID:  h.NexusID,
 		SigAlg:   h.SigAlg,
 		Pubkey:   h.Pubkey,
+		DhAlg:    h.DhAlg,
+		DhPubkey: h.DhPubkey,
 		Endpoint: h.Endpoint,
 		Nonce:    h.Nonce,
 		Ts:       h.Ts,
