@@ -1,0 +1,31 @@
+name: External Availability Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to probe (default: interchange root)'
+        required: false
+        default: 'https://agentnetwork.<tailnet>.ts.net:10000/'
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe URL
+        run: |
+          echo "Target: ${{ github.event.inputs.url || 'https://agentnetwork.<tailnet>.ts.net:10000/' }}"
+          echo "Runner IP:"
+          curl -s https://api.ipify.org
+          echo ""
+          echo "--- Probe result ---"
+          curl -v --max-time 15 \
+            "${{ github.event.inputs.url || 'https://agentnetwork.<tailnet>.ts.net:10000/' }}" \
+            2>&1 || true
+
+      - name: Probe well-known endpoint
+        run: |
+          echo "--- /.well-known/nexus-interchange ---"
+          BASE="${{ github.event.inputs.url || 'https://agentnetwork.<tailnet>.ts.net:10000' }}"
+          BASE="${BASE%/}"
+          curl -v --max-time 15 "${BASE}/.well-known/nexus-interchange" 2>&1 || true
