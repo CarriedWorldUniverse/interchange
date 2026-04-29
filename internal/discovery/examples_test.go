@@ -27,7 +27,7 @@ func TestExampleAlicePubkeyDerivation(t *testing.T) {
 	// Ed25519 implementation.
 }
 
-func TestExampleSelfSigPreimageShape(t *testing.T) {
+func TestExampleSelfSigPreimageV1Shape(t *testing.T) {
 	want := strings.Join([]string{
 		"v1",
 		"alice-nexus",
@@ -37,30 +37,68 @@ func TestExampleSelfSigPreimageShape(t *testing.T) {
 		"AAECAwQFBgcICQoLDA0ODw",
 		"2026-04-30T00:00:00Z",
 	}, "\n")
-	if examplePreimage != want {
-		t.Errorf("preimage drift\ngot:  %q\nwant: %q", examplePreimage, want)
+	if examplePreimageV1 != want {
+		t.Errorf("v1 preimage drift\ngot:  %q\nwant: %q", examplePreimageV1, want)
 	}
-	// Critical contract: LF separators (0x0A), no trailing newline,
-	// fields in order v1/nexus_id/sig_alg/pubkey/endpoint/nonce/ts.
-	if strings.Contains(examplePreimage, "\r") {
-		t.Errorf("preimage contains CR — must be LF only")
+	if strings.Contains(examplePreimageV1, "\r") {
+		t.Errorf("v1 preimage contains CR — must be LF only")
 	}
-	if strings.HasSuffix(examplePreimage, "\n") {
-		t.Errorf("preimage has trailing LF — spec says no trailing newline")
+	if strings.HasSuffix(examplePreimageV1, "\n") {
+		t.Errorf("v1 preimage has trailing LF — spec says no trailing newline")
 	}
 }
 
-func TestExampleSelfSigVerifies(t *testing.T) {
+func TestExampleSelfSigPreimageV2Shape(t *testing.T) {
+	// v2 adds dh_alg + dh_pubkey to the signed payload, between pubkey
+	// and endpoint, so substitution attacks on the ECDH key fail
+	// signature verification.
+	want := strings.Join([]string{
+		"v2",
+		"alice-nexus",
+		"ed25519",
+		alicePubB64u,
+		"P-256",
+		exampleAliceDhPubB64u,
+		"https://alice.example.org:10000",
+		"AAECAwQFBgcICQoLDA0ODw",
+		"2026-04-30T00:00:00Z",
+	}, "\n")
+	if examplePreimageV2 != want {
+		t.Errorf("v2 preimage drift\ngot:  %q\nwant: %q", examplePreimageV2, want)
+	}
+	if strings.Contains(examplePreimageV2, "\r") {
+		t.Errorf("v2 preimage contains CR — must be LF only")
+	}
+	if strings.HasSuffix(examplePreimageV2, "\n") {
+		t.Errorf("v2 preimage has trailing LF — spec says no trailing newline")
+	}
+}
+
+func TestExampleSelfSigV1Verifies(t *testing.T) {
 	seed, _ := hex.DecodeString(aliceSeedHex)
 	priv := ed25519.NewKeyFromSeed(seed)
 	pub := priv.Public().(ed25519.PublicKey)
 
-	sig, err := base64.RawURLEncoding.DecodeString(examplePreimageSig)
+	sig, err := base64.RawURLEncoding.DecodeString(examplePreimageSigV1)
 	if err != nil {
-		t.Fatalf("base64 decode: %v", err)
+		t.Fatalf("base64 decode v1: %v", err)
 	}
-	if !ed25519.Verify(pub, []byte(examplePreimage), sig) {
-		t.Errorf("self-sig does not verify against alice pubkey + preimage — example is broken")
+	if !ed25519.Verify(pub, []byte(examplePreimageV1), sig) {
+		t.Errorf("v1 self-sig does not verify against alice pubkey + v1 preimage — example is broken")
+	}
+}
+
+func TestExampleSelfSigV2Verifies(t *testing.T) {
+	seed, _ := hex.DecodeString(aliceSeedHex)
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+
+	sig, err := base64.RawURLEncoding.DecodeString(examplePreimageSigV2)
+	if err != nil {
+		t.Fatalf("base64 decode v2: %v", err)
+	}
+	if !ed25519.Verify(pub, []byte(examplePreimageV2), sig) {
+		t.Errorf("v2 self-sig does not verify against alice pubkey + v2 preimage — example is broken")
 	}
 }
 
@@ -135,8 +173,14 @@ func TestExamplesAppearInDiscoveryDoc(t *testing.T) {
 	if doc.Examples.TestKeys.AlicePubkeyB64u == "" {
 		t.Errorf("Examples.TestKeys.AlicePubkeyB64u is empty — buildExamples not wired in")
 	}
-	if doc.Examples.PairHalf.Signature == "" {
-		t.Errorf("Examples.PairHalf.Signature is empty")
+	if doc.Examples.PairHalf.V2.Signature == "" {
+		t.Errorf("Examples.PairHalf.V2.Signature is empty")
+	}
+	if doc.Examples.PairHalf.V1.Signature == "" {
+		t.Errorf("Examples.PairHalf.V1.Signature is empty")
+	}
+	if _, ok := doc.Examples.PairHalf.V2.WireJSON["dh_pubkey"]; !ok {
+		t.Errorf("Examples.PairHalf.V2.WireJSON missing dh_pubkey")
 	}
 	if doc.Examples.OuterEnvelope.XNexusSignature == "" {
 		t.Errorf("Examples.OuterEnvelope.XNexusSignature is empty")

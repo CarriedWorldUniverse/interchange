@@ -98,11 +98,31 @@ type ContentHandling struct {
 }
 
 type Pairing struct {
-	Method             string   `json:"method"`
-	Flow               []string `json:"flow"`
-	SelfSigCanonical   string   `json:"self_sig_canonical"`
-	RequestTTLHours    int      `json:"request_ttl_hours"`
-	Note               string   `json:"note"`
+	Method                       string   `json:"method"`
+	Flow                         []string `json:"flow"`
+	SelfSigCanonicalV2           string   `json:"self_sig_canonical_v2"`
+	SelfSigCanonicalV1Deprecated string   `json:"self_sig_canonical_v1_deprecated"`
+	CanonicalVersioningNote      string   `json:"_canonical_versioning_note"`
+	RequestTTLHours              int      `json:"request_ttl_hours"`
+	Note                         string   `json:"note"`
+	HalfSchema                   HalfSchema `json:"half_schema"`
+	ApprovalResponseShape        string     `json:"approval_response_shape"`
+	PollResponseShape            string     `json:"poll_response_shape"`
+}
+
+// HalfSchema describes the wire shape of a pair-half. Both requester
+// and owner halves use this schema. dh_alg + dh_pubkey were added in
+// protocol v2 (covered by the v2 self-sig preimage).
+type HalfSchema struct {
+	NexusID  string `json:"nexus_id"`
+	SigAlg   string `json:"sig_alg"`
+	Pubkey   string `json:"pubkey"`
+	DhAlg    string `json:"dh_alg"`
+	DhPubkey string `json:"dh_pubkey"`
+	Endpoint string `json:"endpoint"`
+	Nonce    string `json:"nonce"`
+	Ts       string `json:"ts"`
+	SelfSig  string `json:"self_sig"`
 }
 
 type Limits struct {
@@ -188,16 +208,31 @@ func New(interchangeID string) Document {
 		Pairing: Pairing{
 			Method: "request + operator approval",
 			Flow: []string{
-				"1. Requester POSTs /pair/request with requester half (nexus_id, sig_alg, dh_alg, pubkey, dh_pubkey, endpoint, nonce, ts, self_sig).",
-				"2. Interchange stores as pending, returns {request_id, status: pending}.",
-				"3. Owner reviews pending requests via dashboard (tailnet-only).",
-				"4. Owner approves: POST /pair/requests/<id>/approve with owner half. Interchange computes pathId, activates pair.",
-				"5. Requester polls GET /pair/requests/<id> until status == approved. Response includes pathId.",
-				"6. Both sides use /mailbox/<pathId> from there on.",
+				"1. Requester POSTs /pair/request with requester half (nexus_id, sig_alg, pubkey, dh_alg, dh_pubkey, endpoint, nonce, ts, self_sig). Self-sig MUST be over the v2 canonical preimage.",
+				"2. Interchange validates self-sig, stores as pending, returns {request_id, status: pending}.",
+				"3. Owner reviews pending requests via tailnet endpoint.",
+				"4. Owner approves: POST /pair/requests/<id>/approve with owner half (same schema). Interchange computes pathId, activates pair, returns {status: approved, path_id, requester_half} so the owner has the requester's full ECDH material to instantiate a local paired channel.",
+				"5. Requester polls GET /pair/requests/<id> until status == approved. Approved response returns {path_id, owner_half} so the requester has the owner's full ECDH material to instantiate a local paired channel.",
+				"6. Both sides use /mailbox/<pathId> from there on. No out-of-band PairingToken exchange is required — both halves carry the dh_pubkey under signature coverage.",
 			},
-			SelfSigCanonical: "line-oriented UTF-8, fields joined by \\n (0x0A), no trailing newline:\nv1\n<nexus_id>\n<sig_alg>\n<pubkey base64url>\n<endpoint or empty>\n<nonce base64url>\n<ts>",
-			RequestTTLHours:  24,
-			Note:             "pair_approve: null and pair_deny: null in endpoints block signal these are tailnet-only. A requester cannot approve itself. Trust establishment is always operator-human mediated.",
+			SelfSigCanonicalV2: "line-oriented UTF-8, fields joined by \\n (0x0A), no trailing newline:\nv2\n<nexus_id>\n<sig_alg>\n<pubkey base64url>\n<dh_alg>\n<dh_pubkey base64url>\n<endpoint or empty>\n<nonce base64url>\n<ts>",
+			SelfSigCanonicalV1Deprecated: "line-oriented UTF-8, fields joined by \\n (0x0A), no trailing newline:\nv1\n<nexus_id>\n<sig_alg>\n<pubkey base64url>\n<endpoint or empty>\n<nonce base64url>\n<ts>",
+			CanonicalVersioningNote: "v2 is the preimage version current implementations MUST write. v1 is accepted by verifiers during the v1→v2 transition window but new halves SHOULD use v2 — v1 omits the ECDH pubkey from signature coverage, leaving dh_pubkey vulnerable to substitution at storage. The first line of the preimage (`v1` or `v2`) declares which preimage shape is in use; relays accept either while v1 callers still exist, then deprecate.",
+			RequestTTLHours: 24,
+			Note:            "pair_approve: null and pair_deny: null in endpoints block signal these are tailnet-only. A requester cannot approve itself. Trust establishment is always operator-human mediated.",
+			HalfSchema: HalfSchema{
+				NexusID:  "<requester or owner nexus id>",
+				SigAlg:   "ed25519 (only value at v1)",
+				Pubkey:   "<base64url, 32-byte raw Ed25519 public key>",
+				DhAlg:    "P-256 or X25519",
+				DhPubkey: "<base64url, 65-byte SEC1 P-256 OR 32-byte raw X25519>",
+				Endpoint: "<https URL or empty>",
+				Nonce:    "<base64url, 16+ random bytes>",
+				Ts:       "<ISO 8601 UTC, e.g. 2026-04-30T00:00:00Z>",
+				SelfSig:  "<base64url, 64-byte detached Ed25519 signature over v2 canonical preimage>",
+			},
+			ApprovalResponseShape: `{"request_id": "<uuid>", "status": "approved", "path_id": "nxc_<base64url>", "requester_half": <half schema>}`,
+			PollResponseShape:     `{"request_id": "<uuid>", "status": "pending|approved|denied|expired", "path_id": "<nxc_...>", "owner_half": <half schema, present when approved>}`,
 		},
 		Limits: Limits{
 			ReplayWindowSeconds: 300,

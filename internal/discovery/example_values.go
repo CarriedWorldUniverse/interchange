@@ -30,12 +30,25 @@ var (
 	alicePubB64u, alicePrivKey = mustEdKey(aliceSeedHex)
 	bobPubB64u, _              = mustEdKey(bobSeedHex)
 
-	examplePreimage    = buildPreimage()
-	examplePreimageSig = signPreimage(alicePrivKey, examplePreimage)
+	// Fixed P-256 dh_pubkey for alice — deterministic so the example is
+	// reproducible. Real implementations generate fresh keys per identity.
+	exampleDhAlg          = "P-256"
+	exampleAliceDhPubB64u = "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0"
 
-	exampleOuterCanonical    = buildExampleOuter()
-	exampleOuterWireHex      = hex.EncodeToString([]byte(exampleOuterCanonical))
-	exampleOuterSig          = signCanonical(alicePrivKey, exampleOuterCanonical)
+	// v1 (deprecated) preimage + signature — kept for reference so an
+	// implementer migrating from v1 has the canonical bytes that produce
+	// the v1 example signature.
+	examplePreimageV1    = buildPreimageV1()
+	examplePreimageSigV1 = signPreimage(alicePrivKey, examplePreimageV1)
+
+	// v2 (current) preimage + signature — what new implementations MUST
+	// write. Includes dh_alg + dh_pubkey under signature coverage.
+	examplePreimageV2    = buildPreimageV2()
+	examplePreimageSigV2 = signPreimage(alicePrivKey, examplePreimageV2)
+
+	exampleOuterCanonical      = buildExampleOuter()
+	exampleOuterWireHex        = hex.EncodeToString([]byte(exampleOuterCanonical))
+	exampleOuterSig            = signCanonical(alicePrivKey, exampleOuterCanonical)
 	exampleCiphertextSHA256Hex = computeCiphertextSHA256()
 
 	examplePathID = derivePathID(alicePubB64u, bobPubB64u)
@@ -51,16 +64,37 @@ func mustEdKey(seedHex string) (string, ed25519.PrivateKey) {
 	return base64.RawURLEncoding.EncodeToString(pub), priv
 }
 
-// buildPreimage produces the line-oriented UTF-8 self-sig preimage per
-// the discovery doc's pairing.self_sig_canonical: "v1\n<nexus_id>\n
-// <sig_alg>\n<pubkey b64u>\n<endpoint>\n<nonce b64u>\n<ts>", no
-// trailing newline.
-func buildPreimage() string {
+// buildPreimageV1 produces the deprecated v1 line-oriented UTF-8
+// self-sig preimage:
+// "v1\n<nexus_id>\n<sig_alg>\n<pubkey b64u>\n<endpoint>\n<nonce b64u>\n<ts>",
+// no trailing newline. v1 is accepted by relays during the v1→v2
+// transition window. New halves MUST use v2.
+func buildPreimageV1() string {
 	return strings.Join([]string{
 		"v1",
 		exampleNexusID,
 		"ed25519",
 		alicePubB64u,
+		exampleEndpoint,
+		exampleNonce,
+		exampleTs,
+	}, "\n")
+}
+
+// buildPreimageV2 produces the current v2 line-oriented UTF-8 self-sig
+// preimage:
+// "v2\n<nexus_id>\n<sig_alg>\n<pubkey b64u>\n<dh_alg>\n<dh_pubkey b64u>\n<endpoint>\n<nonce b64u>\n<ts>",
+// no trailing newline. dh_alg + dh_pubkey are under signature coverage,
+// so a relay or wire observer cannot substitute the dh_pubkey without
+// invalidating the signature.
+func buildPreimageV2() string {
+	return strings.Join([]string{
+		"v2",
+		exampleNexusID,
+		"ed25519",
+		alicePubB64u,
+		exampleDhAlg,
+		exampleAliceDhPubB64u,
 		exampleEndpoint,
 		exampleNonce,
 		exampleTs,

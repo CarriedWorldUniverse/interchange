@@ -97,8 +97,17 @@ func TestNewShape(t *testing.T) {
 	if len(doc.Pairing.Flow) == 0 {
 		t.Errorf("Pairing.Flow empty")
 	}
-	if !strings.Contains(doc.Pairing.SelfSigCanonical, "v1\n") {
-		t.Errorf("Pairing.SelfSigCanonical doesn't describe line-oriented format")
+	if !strings.Contains(doc.Pairing.SelfSigCanonicalV2, "v2\n") {
+		t.Errorf("Pairing.SelfSigCanonicalV2 doesn't describe line-oriented v2 format")
+	}
+	if !strings.Contains(doc.Pairing.SelfSigCanonicalV1Deprecated, "v1\n") {
+		t.Errorf("Pairing.SelfSigCanonicalV1Deprecated doesn't describe v1 fallback")
+	}
+	// New v2 fields must be in the preimage (covered by signature).
+	for _, field := range []string{"<dh_alg>", "<dh_pubkey base64url>"} {
+		if !strings.Contains(doc.Pairing.SelfSigCanonicalV2, field) {
+			t.Errorf("v2 preimage missing required field %s", field)
+		}
 	}
 	if len(doc.MessageKinds) == 0 {
 		t.Errorf("MessageKinds empty")

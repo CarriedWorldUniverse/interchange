@@ -282,7 +282,9 @@ Unauthenticated, public, returned in full on every GET. A new Nexus (or AI agent
       "5. Requester polls GET /pair/requests/<id> until status == approved. Response includes pathId.",
       "6. Both sides use /mailbox/<pathId> from there on."
     ],
-    "self_sig_canonical": "line-oriented UTF-8, fields joined by \\n (0x0A), no trailing newline:\nv1\n<nexus_id>\n<sig_alg>\n<pubkey base64url>\n<endpoint or empty>\n<nonce base64url>\n<ts>",
+    "self_sig_canonical_v2": "line-oriented UTF-8, fields joined by \\n (0x0A), no trailing newline:\nv2\n<nexus_id>\n<sig_alg>\n<pubkey base64url>\n<dh_alg>\n<dh_pubkey base64url>\n<endpoint or empty>\n<nonce base64url>\n<ts>",
+    "self_sig_canonical_v1_deprecated": "line-oriented UTF-8, fields joined by \\n (0x0A), no trailing newline:\nv1\n<nexus_id>\n<sig_alg>\n<pubkey base64url>\n<endpoint or empty>\n<nonce base64url>\n<ts>",
+    "_canonical_versioning": "v2 is the preimage version current implementations MUST write. v1 is accepted by verifiers during the v1→v2 transition but new halves SHOULD use v2 — v1 omits the ECDH pubkey from signature coverage, which leaves dh_pubkey vulnerable to substitution at storage. The first line of the preimage (`v1` or `v2`) declares which preimage shape is in use; relays accept either at v1.1 of the protocol.",
     "request_ttl_hours": 24,
     "note": "pair_approve: null and pair_deny: null in endpoints block signal these are tailnet-only. A requester cannot approve itself. Trust establishment is always operator-human mediated."
   },
@@ -489,7 +491,8 @@ Lists pending requests. Owner auth via shared-secret header set in service confi
 
 Computes `pathId = "nxc_" + base64url(sha256(sort(requester.pubkey_wire, owner.pubkey_wire)))` — wire-format bytes (raw 32 for Ed25519; v1 is Ed25519-only), sorted ascending, hashed.
 
-- `200 OK` — `{ "request_id": "...", "status": "approved", "path_id": "nxc_..." }`.
+- `200 OK` — `{ "request_id": "...", "status": "approved", "path_id": "nxc_...", "requester_half": { full half — schema as in `POST /pair/request` body's `requester` field } }`.
+  - The `requester_half` field returns the requester's full half (including `dh_alg`/`dh_pubkey`) so the owner can locally instantiate a paired channel against the requester's public material immediately, without a separate fetch or out-of-band exchange.
 - `400` — signature/schema/algorithm mismatch.
 - `404` — unknown request.
 - `409` — not in `pending` state.
@@ -508,11 +511,14 @@ Requester polls for status. Opaque request_id means guessing is infeasible.
 {
   "request_id": "<uuid>",
   "status": "pending" | "approved" | "denied" | "expired",
-  "path_id": "<nxc_...>"
+  "path_id": "<nxc_...>",
+  "owner_half": { full half — schema as in `POST /pair/request` body's `requester` field, but for the owner }
 }
 ```
 
-`path_id` present only when `approved`.
+`path_id` and `owner_half` are present only when `status == "approved"`. The `owner_half` field returns the owner's full half (including `dh_alg`/`dh_pubkey`) so the requester can locally instantiate a paired channel against the owner's public material immediately, without a separate fetch or out-of-band exchange.
+
+**Why the relay returns each peer's half to the other:** ECDH public keys are public material — their job is to be shared so the other party can derive the per-channel shared secret. Hiding them from the relay provides no security benefit (the relay can't derive the secret without a private key, which never leaves the client). The pair-half's self-signature MUST cover `dh_pubkey` (preimage v2) so a relay-or-MitM substitution of the dh_pubkey is detected at signature verification on submit. With that signature coverage in place, returning the peer's half over the existing pair-flow channel is safe and removes the need for any out-of-band PairingToken exchange.
 
 #### `GET /health`
 

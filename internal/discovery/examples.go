@@ -32,6 +32,15 @@ type ExampleTestKeys struct {
 }
 
 type ExamplePairHalf struct {
+	Note string `json:"note"`
+	V2   ExamplePairHalfVersion `json:"v2_current"`
+	V1   ExamplePairHalfVersion `json:"v1_deprecated"`
+}
+
+// ExamplePairHalfVersion is one preimage/signature pair for a given
+// preimage version. Both v1 (deprecated, transition support) and v2
+// (current) are published so an implementer can validate either.
+type ExamplePairHalfVersion struct {
 	Note      string            `json:"note"`
 	Preimage  string            `json:"self_sig_preimage_lf_separated"`
 	Signature string            `json:"self_sig_base64url"`
@@ -86,19 +95,42 @@ func buildExamples() Examples {
 
 		PairHalf: ExamplePairHalf{
 			Note: "A pair-half submitted to POST /pair/request as the requester field, " +
-				"or to POST /pair/requests/<id>/approve as the owner field. " +
-				"The preimage is the line-oriented UTF-8 form fed to ed25519.Sign; " +
-				"the signature is detached, base64url-encoded.",
-			Preimage:  examplePreimage,
-			Signature: examplePreimageSig,
-			WireJSON: map[string]string{
-				"nexus_id": exampleNexusID,
-				"sig_alg":  "ed25519",
-				"pubkey":   alicePubB64u,
-				"endpoint": exampleEndpoint,
-				"nonce":    exampleNonce,
-				"ts":       exampleTs,
-				"self_sig": examplePreimageSig,
+				"or to POST /pair/requests/<id>/approve as the owner field. Two preimage " +
+				"versions are published: v2 is current (signature covers dh_alg + dh_pubkey, " +
+				"preventing substitution); v1 is deprecated but still accepted by relays " +
+				"during the migration window. New implementations MUST write v2.",
+			V2: ExamplePairHalfVersion{
+				Note: "v2 (current). Preimage covers ECDH material so a relay or wire " +
+					"observer cannot swap dh_pubkey without invalidating the signature.",
+				Preimage:  examplePreimageV2,
+				Signature: examplePreimageSigV2,
+				WireJSON: map[string]string{
+					"nexus_id":  exampleNexusID,
+					"sig_alg":   "ed25519",
+					"pubkey":    alicePubB64u,
+					"dh_alg":    exampleDhAlg,
+					"dh_pubkey": exampleAliceDhPubB64u,
+					"endpoint":  exampleEndpoint,
+					"nonce":     exampleNonce,
+					"ts":        exampleTs,
+					"self_sig":  examplePreimageSigV2,
+				},
+			},
+			V1: ExamplePairHalfVersion{
+				Note: "v1 (DEPRECATED). dh_pubkey is NOT covered by the signature in v1, " +
+					"making it vulnerable to substitution. Provided here only for reference " +
+					"during migration. Do not use for new pair attempts.",
+				Preimage:  examplePreimageV1,
+				Signature: examplePreimageSigV1,
+				WireJSON: map[string]string{
+					"nexus_id": exampleNexusID,
+					"sig_alg":  "ed25519",
+					"pubkey":   alicePubB64u,
+					"endpoint": exampleEndpoint,
+					"nonce":    exampleNonce,
+					"ts":       exampleTs,
+					"self_sig": examplePreimageSigV1,
+				},
 			},
 		},
 
