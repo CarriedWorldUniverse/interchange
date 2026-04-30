@@ -455,14 +455,25 @@ func (h *Handler) listPending(w http.ResponseWriter, r *http.Request) {
 		}
 		// Surface a trimmed requester view — drop the full self-sig
 		// for cleaner dashboards; operator sees enough to decide.
+		// dh_alg + dh_pubkey are surfaced when present (v2 halves) so
+		// the operator can distinguish v1 vs v2 requesters at a glance
+		// before approving. omitempty preserved — v1 halves carry no
+		// ECDH material and the trimmed view stays clean.
 		var r half
 		if err := json.Unmarshal([]byte(req.RequesterJSON), &r); err == nil {
-			rendered["requester"] = map[string]string{
+			requesterView := map[string]string{
 				"nexus_id": r.NexusID,
 				"sig_alg":  r.SigAlg,
 				"pubkey":   r.Pubkey,
 				"endpoint": r.Endpoint,
 			}
+			if r.DhAlg != "" {
+				requesterView["dh_alg"] = r.DhAlg
+			}
+			if r.DhPubkey != "" {
+				requesterView["dh_pubkey"] = r.DhPubkey
+			}
+			rendered["requester"] = requesterView
 		}
 		out = append(out, rendered)
 	}

@@ -76,6 +76,34 @@ func TestNewShape(t *testing.T) {
 	if !strings.Contains(doc.Crypto.Encryption.AAD, "No separator") {
 		t.Errorf("Crypto.Encryption.AAD must specify concatenation rule (no separator), got: %q", doc.Crypto.Encryption.AAD)
 	}
+	// Task #60: ack signing rule documented in WhatIsSigned. Cold
+	// adopters need to know /ack signs path+query (like GET) and NOT
+	// the body, despite being a POST.
+	if !strings.Contains(strings.ToLower(doc.Crypto.Signing.WhatIsSigned), "ack") {
+		t.Errorf("Crypto.Signing.WhatIsSigned must describe /ack signing rule, got: %q", doc.Crypto.Signing.WhatIsSigned)
+	}
+	// Task #64: HKDF info string surfaced as a standalone field — not
+	// only buried inside examples.aead_vector.
+	if doc.Crypto.Encryption.KDFInfo != "nexus-casket-channel-v1" {
+		t.Errorf("Crypto.Encryption.KDFInfo = %q, want nexus-casket-channel-v1", doc.Crypto.Encryption.KDFInfo)
+	}
+	// Task #65: enumerate accepted dh_alg labels — case and form matter
+	// (cold adopters tried "p256" lowercase first; spec uses "P-256").
+	if len(doc.Crypto.Encryption.KeyExchangeValues) == 0 {
+		t.Errorf("Crypto.Encryption.KeyExchangeValues empty — cold adopters must see accepted labels")
+	}
+	gotP256, gotX25519 := false, false
+	for _, v := range doc.Crypto.Encryption.KeyExchangeValues {
+		if v == "P-256" {
+			gotP256 = true
+		}
+		if v == "X25519" {
+			gotX25519 = true
+		}
+	}
+	if !gotP256 || !gotX25519 {
+		t.Errorf("Crypto.Encryption.KeyExchangeValues = %v, must include both P-256 and X25519", doc.Crypto.Encryption.KeyExchangeValues)
+	}
 	if doc.Crypto.CanonicalJSON.Standard == "" {
 		t.Errorf("Crypto.CanonicalJSON.Standard empty")
 	}

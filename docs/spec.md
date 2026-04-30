@@ -459,6 +459,8 @@ Response: `200 OK`, `{ "envelopes": [outer, ...], "cursor": "<msg_id>" }`.
 
 `{ "ids": ["<msg_id>", ...] }` → `200 OK`, `{ "evicted": <count> }`. Advisory — Frame's `seen` is source of truth.
 
+Signing rule: ack signs `path+query` (same as GET), despite being a POST. The body JSON is NOT included in the signature preimage.
+
 #### `POST /pair/request` — requester initiates
 
 **Body:**

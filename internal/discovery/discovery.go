@@ -67,12 +67,14 @@ type Signing struct {
 }
 
 type Encryption struct {
-	KeyExchange string            `json:"key_exchange"`
-	KeyFormat   map[string]string `json:"key_format"`
-	KDF         string            `json:"kdf"`
-	Symmetric   string            `json:"symmetric"`
-	Nonce       string            `json:"nonce"`
-	AAD         string            `json:"aad"`
+	KeyExchange       string            `json:"key_exchange"`
+	KeyExchangeValues []string          `json:"key_exchange_values"`
+	KeyFormat         map[string]string `json:"key_format"`
+	KDF               string            `json:"kdf"`
+	KDFInfo           string            `json:"kdf_info"`
+	Symmetric         string            `json:"symmetric"`
+	Nonce             string            `json:"nonce"`
+	AAD               string            `json:"aad"`
 }
 
 type CanonicalJSON struct {
@@ -155,7 +157,7 @@ func New(interchangeID string) Document {
 		Auth: Auth{
 			Scheme: "Ed25519",
 			Header: "X-Nexus-Signature",
-			Note:   "Detached signature over canonical JSON request body (PUT) or path+query (GET). Key pinned at pairing.",
+			Note:   "Detached signature over canonical JSON request body (PUT) or path+query (GET). POST /mailbox/:pathId/ack signs path+query (same as GET, despite being a POST) — the body is JSON but is NOT included in the signature preimage. Key pinned at pairing.",
 		},
 		Crypto: Crypto{
 			Signing: Signing{
@@ -171,15 +173,17 @@ func New(interchangeID string) Document {
 				},
 				SignatureFormat: "detached 64-byte Ed25519 signature, base64url-encoded",
 				Header:          "X-Nexus-Signature",
-				WhatIsSigned:    "PUT: canonical JSON of outer envelope; GET: UTF-8 of path+query (e.g. /mailbox/nxc_xxx?since=yyy)",
+				WhatIsSigned:    "PUT: canonical JSON of outer envelope; GET: UTF-8 of path+query (e.g. /mailbox/nxc_xxx?since=yyy); ack: POST /mailbox/:pathId/ack signs path+query (same as GET, despite being a POST) — the body JSON is NOT included in the signature preimage.",
 			},
 			Encryption: Encryption{
-				KeyExchange: "P-256 ECDH (default) or X25519 ECDH (negotiated via pairing token dh_alg). Both sides MUST match.",
+				KeyExchange:       "P-256 ECDH (default) or X25519 ECDH (negotiated via pairing-half dh_alg; see key_exchange_values for accepted labels). Both sides MUST match.",
+				KeyExchangeValues: []string{"P-256", "X25519"},
 				KeyFormat: map[string]string{
 					"p256":   "65-byte uncompressed SEC1 point (0x04 || 32 || 32)",
 					"x25519": "raw 32-byte public key",
 				},
 				KDF:       "HKDF-SHA256 over ECDH shared secret → 32-byte symmetric key",
+				KDFInfo:   "nexus-casket-channel-v1",
 				Symmetric: "AES-256-GCM",
 				Nonce:     "96-bit random nonce, prepended to ciphertext",
 				AAD:       "UTF-8 string bytes of `path_id` concatenated with UTF-8 string bytes of `msg_id`. No separator, no length prefix. path_id and msg_id are ASCII so UTF-8 == raw string bytes. Pass the concatenated bytes as the AEAD AAD on both encrypt and decrypt. This binds the AEAD-tagged ciphertext to the specific path and message — replaying to a different path_id or msg_id fails authentication at decrypt. Both sides know these values before encrypting.",

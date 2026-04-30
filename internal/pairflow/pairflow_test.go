@@ -446,6 +446,68 @@ func TestListPendingReturnsStagedRequests(t *testing.T) {
 	}
 }
 
+// Task #57: pending listing exposes dh_alg/dh_pubkey from v2 halves so
+// the operator can distinguish v1 vs v2 requesters before approval.
+// v1 halves (no ECDH material) must still render cleanly with no empty
+// dh_alg/dh_pubkey keys leaking through (omitempty semantics preserved).
+func TestListPendingExposesV2DHFields(t *testing.T) {
+	h, _ := fixture(t)
+	// Seed a v2-shape pending request.
+	pub, priv, _ := ed25519.GenerateKey(nil)
+	v2 := signedHalfV2("v2bob", "https://v2bob.example", "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0", h.now(), pub, priv)
+	body, _ := json.Marshal(map[string]any{
+		"target_nexus_id": "alice",
+		"requester":       halfToWire(v2),
+	})
+	rr := doPublic(t, h, http.MethodPost, "/pair/request", body)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("seed v2 create: %d %s", rr.Code, rr.Body.String())
+	}
+	// Also seed a v1-shape pending request to verify omitempty behaviour
+	// (v1 halves should NOT carry empty dh_alg/dh_pubkey in the listing).
+	_ = createPendingRequest(t, h)
+
+	rr = doOwner(t, h, http.MethodGet, "/pair/requests?status=pending", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	var resp struct {
+		Requests []map[string]any `json:"requests"`
+	}
+	_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+	if len(resp.Requests) != 2 {
+		t.Fatalf("len = %d, want 2", len(resp.Requests))
+	}
+	sawV2 := false
+	for _, item := range resp.Requests {
+		req, _ := item["requester"].(map[string]any)
+		if req == nil {
+			continue
+		}
+		nexusID, _ := req["nexus_id"].(string)
+		if nexusID == "v2bob" {
+			sawV2 = true
+			if req["dh_alg"] != "P-256" {
+				t.Errorf("v2 listing requester.dh_alg = %v, want P-256", req["dh_alg"])
+			}
+			if req["dh_pubkey"] != "BKj9Hfm4WU9ZUfCJuvLiAYgyVaTT64WTITLGp30yjYGvqXNd1LaZNeXqzaV7D34eGaR2Fiz9cJQTmfUy2nLHZP0" {
+				t.Errorf("v2 listing requester.dh_pubkey unexpected: %v", req["dh_pubkey"])
+			}
+		} else {
+			// v1 half — must NOT carry empty dh_alg/dh_pubkey keys.
+			if _, leaked := req["dh_alg"]; leaked {
+				t.Errorf("v1 listing leaked empty dh_alg key: %v", req)
+			}
+			if _, leaked := req["dh_pubkey"]; leaked {
+				t.Errorf("v1 listing leaked empty dh_pubkey key: %v", req)
+			}
+		}
+	}
+	if !sawV2 {
+		t.Errorf("v2 requester missing from listing: %+v", resp.Requests)
+	}
+}
+
 func TestListPendingRejectsOtherStatus(t *testing.T) {
 	h, _ := fixture(t)
 	rr := doOwner(t, h, http.MethodGet, "/pair/requests?status=approved", nil)
