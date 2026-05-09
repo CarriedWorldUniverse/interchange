@@ -20,7 +20,7 @@ func TestHandlerRootReturnsHTML(t *testing.T) {
 	if !strings.Contains(body, "<title>interchange</title>") {
 		t.Errorf("missing lowercase title: %s", body[:200])
 	}
-	if !strings.Contains(body, "github.com/nexus-cw/interchange") {
+	if !strings.Contains(body, "github.com/CarriedWorldUniverse/interchange") {
 		t.Errorf("missing github link")
 	}
 }

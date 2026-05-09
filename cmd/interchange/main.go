@@ -40,14 +40,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/nexus-cw/interchange/internal/crypto"
-	"github.com/nexus-cw/interchange/internal/discovery"
-	"github.com/nexus-cw/interchange/internal/landing"
-	"github.com/nexus-cw/interchange/internal/mailbox"
-	"github.com/nexus-cw/interchange/internal/middleware"
-	"github.com/nexus-cw/interchange/internal/pairflow"
-	"github.com/nexus-cw/interchange/internal/storage"
-	"github.com/nexus-cw/interchange/internal/sweep"
+	"github.com/CarriedWorldUniverse/interchange/internal/crypto"
+	"github.com/CarriedWorldUniverse/interchange/internal/discovery"
+	"github.com/CarriedWorldUniverse/interchange/internal/landing"
+	"github.com/CarriedWorldUniverse/interchange/internal/mailbox"
+	"github.com/CarriedWorldUniverse/interchange/internal/middleware"
+	"github.com/CarriedWorldUniverse/interchange/internal/pairflow"
+	"github.com/CarriedWorldUniverse/interchange/internal/storage"
+	"github.com/CarriedWorldUniverse/interchange/internal/sweep"
 )
 
 func main() {
