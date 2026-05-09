@@ -22,8 +22,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/nexus-cw/interchange/internal/mailbox"
-	"github.com/nexus-cw/interchange/internal/storage"
+	"github.com/CarriedWorldUniverse/interchange/internal/mailbox"
+	"github.com/CarriedWorldUniverse/interchange/internal/storage"
 )
 
 // ErrUnsupportedAlgorithm is returned when a registered pair claims a

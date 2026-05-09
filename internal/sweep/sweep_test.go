@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nexus-cw/interchange/internal/storage"
+	"github.com/CarriedWorldUniverse/interchange/internal/storage"
 )
 
 func newStore(t *testing.T) *storage.SQLite {

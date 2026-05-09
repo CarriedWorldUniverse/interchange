@@ -1,4 +1,4 @@
-module github.com/nexus-cw/interchange
+module github.com/CarriedWorldUniverse/interchange
 
 go 1.25.0
 
