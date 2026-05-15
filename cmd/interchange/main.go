@@ -32,6 +32,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -48,6 +49,7 @@ import (
 	"github.com/CarriedWorldUniverse/interchange/internal/pairflow"
 	"github.com/CarriedWorldUniverse/interchange/internal/storage"
 	"github.com/CarriedWorldUniverse/interchange/internal/sweep"
+	"github.com/CarriedWorldUniverse/interchange/internal/version"
 )
 
 func main() {
@@ -59,8 +61,14 @@ func main() {
 		sweepInterval  = flag.Duration("sweep-interval", time.Hour, "retention sweep cadence")
 		envelopeMaxAge = flag.Duration("envelope-max-age", 7*24*time.Hour, "envelope retention age; older rows evicted on sweep")
 		ownerSecret    = flag.String("owner-secret", "", "optional shared secret required on owner (tailnet) endpoints — layers on top of tailnet binding. Empty = no header check.")
+		showVersion    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("interchange %s\n", version.Version)
+		return
+	}
 
 	if *interchangeID == "" {
 		log.Fatal("interchange: -id is required (owner nexus_id)")
