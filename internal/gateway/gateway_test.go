@@ -204,6 +204,146 @@ func TestHealthz_NotProxied(t *testing.T) {
 	}
 }
 
+func TestPublicPaths_ExactMatchBypassesAuth(t *testing.T) {
+	backend := echoBackend(t)
+	defer backend.Close()
+	g, err := gateway.New(gateway.Config{
+		Verifier:    fakeVerifier{}, // would error if invoked
+		AuthBypass:  false,
+		Routes:      map[string]string{"/herald": backend.URL},
+		PublicPaths: []string{"/herald/jwks"},
+	})
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	srv := httptest.NewServer(g.Handler())
+	defer srv.Close()
+
+	// Public path: no Authorization header, expect 200 + prefix-stripped path.
+	resp, err := http.Get(srv.URL + "/herald/jwks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("public path status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Echo-Path"); got != "/jwks" {
+		t.Errorf("backend path = %q, want /jwks (prefix stripped)", got)
+	}
+	// No identity should be injected on a public hit.
+	if got := resp.Header.Get("X-Echo-Org"); got != "" {
+		t.Errorf("X-CWB-Org should be absent on public hit, got %q", got)
+	}
+}
+
+func TestPublicPaths_PrefixMatchBypassesAuth(t *testing.T) {
+	backend := echoBackend(t)
+	defer backend.Close()
+	g, err := gateway.New(gateway.Config{
+		Verifier:    fakeVerifier{},
+		AuthBypass:  false,
+		Routes:      map[string]string{"/herald": backend.URL},
+		PublicPaths: []string{"/herald/.well-known/"}, // trailing / = prefix
+	})
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	srv := httptest.NewServer(g.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/herald/.well-known/openid-configuration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("well-known status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Echo-Path"); got != "/.well-known/openid-configuration" {
+		t.Errorf("backend path = %q", got)
+	}
+}
+
+func TestPublicPaths_NonPublicStill401(t *testing.T) {
+	backend := echoBackend(t)
+	defer backend.Close()
+	g, err := gateway.New(gateway.Config{
+		Verifier:    fakeVerifier{},
+		AuthBypass:  false,
+		Routes:      map[string]string{"/herald": backend.URL},
+		PublicPaths: []string{"/herald/jwks"},
+	})
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	srv := httptest.NewServer(g.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/herald/api/orgs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("non-public path status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestPublicPaths_StillStripSpoofedHeaders(t *testing.T) {
+	backend := echoBackend(t)
+	defer backend.Close()
+	g, err := gateway.New(gateway.Config{
+		Verifier:    fakeVerifier{},
+		AuthBypass:  false,
+		Routes:      map[string]string{"/herald": backend.URL},
+		PublicPaths: []string{"/herald/jwks"},
+	})
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	srv := httptest.NewServer(g.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/herald/jwks", nil)
+	req.Header.Set("X-CWB-Org", "spoofed-org")
+	req.Header.Set("X-CWB-Subject", "spoofed-sub")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := resp.Header.Get("X-Echo-Org"); got != "" {
+		t.Errorf("spoofed org leaked through public path: %q", got)
+	}
+	if got := resp.Header.Get("X-Echo-Subject"); got != "" {
+		t.Errorf("spoofed subject leaked through public path: %q", got)
+	}
+}
+
+func TestPublicPaths_WithoutMatchingRouteStill404(t *testing.T) {
+	g, err := gateway.New(gateway.Config{
+		Verifier:    fakeVerifier{},
+		AuthBypass:  false,
+		Routes:      map[string]string{"/herald": "http://unused"},
+		PublicPaths: []string{"/anywhere"},
+	})
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	srv := httptest.NewServer(g.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/anywhere")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("public-but-no-route status = %d, want 404", resp.StatusCode)
+	}
+}
+
 func TestRoute_LongestPrefixWins(t *testing.T) {
 	b1 := echoBackend(t)
 	defer b1.Close()

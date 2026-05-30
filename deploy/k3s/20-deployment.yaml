@@ -29,6 +29,10 @@ spec:
               value: "/herald=http://herald.cwb.svc:8099"
             - name: INTERCHANGE_HERALD_ISSUER
               value: "http://herald.cwb.svc:8099/"
+            - name: INTERCHANGE_PUBLIC_PATHS
+              # Discovery + JWKS must be reachable without a token so
+              # consumers can fetch the keys before minting one.
+              value: "/herald/.well-known/,/herald/jwks"
           readinessProbe:
             httpGet:
               path: /healthz
