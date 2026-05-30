@@ -1,7 +1,7 @@
 github.com/CarriedWorldUniverse/casket-go v0.1.0 h1:t+DvXs8vhaNcTfkSS/sqK47fBTNVRdHfF7DT/ur0jtY=
 github.com/CarriedWorldUniverse/casket-go v0.1.0/go.mod h1:v0y8kPW/WmusBw+Q3ZtRYhVwoK/WVVVXHWSc/oRVWBo=
-github.com/CarriedWorldUniverse/herald v0.0.0-20260530085721-10621a6d5c5c h1:L8iLG0Cz1IrJthnDNhXFgpiEteASg1DiSuuo+SxxTa0=
-github.com/CarriedWorldUniverse/herald v0.0.0-20260530085721-10621a6d5c5c/go.mod h1:qZQJ9tYMkwUwehd/cfrmqd5nzVD+IkIFi16kNKObYnQ=
+github.com/CarriedWorldUniverse/herald v0.0.0-20260530171727-a254c696f93b h1:QzoORjq7RnoTaHu2fYo0Rv+pwB/X9jbWS1h1FwNJROc=
+github.com/CarriedWorldUniverse/herald v0.0.0-20260530171727-a254c696f93b/go.mod h1:qZQJ9tYMkwUwehd/cfrmqd5nzVD+IkIFi16kNKObYnQ=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/go-jose/go-jose/v4 v4.1.4 h1:moDMcTHmvE6Groj34emNPLs/qtYXRVcd6S7NHbHz3kA=

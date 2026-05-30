@@ -13,6 +13,12 @@
 //	INTERCHANGE_ROUTES         "prefix=backend,prefix=backend,..." e.g.
 //	                           "/herald=http://herald:8099,/ledger=http://ledger:8080"
 //	INTERCHANGE_HERALD_ISSUER  herald issuer URL (required unless bypass) — for JWKS verify
+//	INTERCHANGE_HERALD_JWKS_URL optional override pointing heraldauth at an
+//	                           internal JWKS endpoint instead of going through
+//	                           discovery on the public issuer. Use this when
+//	                           the gateway is fronting its own issuer to avoid
+//	                           a boot loop calling itself, e.g.
+//	                             INTERCHANGE_HERALD_JWKS_URL=http://herald.cwb.svc:8099/jwks
 //	INTERCHANGE_AUTH_BYPASS    "1" to skip auth (mode-1 standalone)
 //	INTERCHANGE_PUBLIC_PATHS   "path,path,..." gateway-side paths that skip
 //	                           bearer-token verification (routing + anti-spoof
@@ -52,7 +58,10 @@ func main() {
 		if issuer == "" {
 			log.Fatal("interchange-gateway: INTERCHANGE_HERALD_ISSUER required (or set INTERCHANGE_AUTH_BYPASS=1)")
 		}
-		hv, err := heraldauth.New(context.Background(), heraldauth.Config{Issuer: issuer})
+		hv, err := heraldauth.New(context.Background(), heraldauth.Config{
+			Issuer:  issuer,
+			JWKSURL: os.Getenv("INTERCHANGE_HERALD_JWKS_URL"),
+		})
 		if err != nil {
 			log.Fatalf("interchange-gateway: herald verifier (issuer=%s): %v", issuer, err)
 		}

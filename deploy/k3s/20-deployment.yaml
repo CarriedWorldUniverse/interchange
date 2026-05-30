@@ -28,7 +28,13 @@ spec:
             - name: INTERCHANGE_ROUTES
               value: "/herald=http://herald.cwb.svc:8099"
             - name: INTERCHANGE_HERALD_ISSUER
-              value: "http://herald.cwb.svc:8099/"
+              # Must match HERALD_ISSUER exactly — this is what the `iss`
+              # claim is checked against.
+              value: "http://dmonextreme.tail41686e.ts.net:8080/herald/"
+            - name: INTERCHANGE_HERALD_JWKS_URL
+              # Internal JWKS path — the gateway can't fetch discovery via
+              # itself before it's listening, so go direct to herald.
+              value: "http://herald.cwb.svc:8099/jwks"
             - name: INTERCHANGE_PUBLIC_PATHS
               # Discovery + JWKS must be reachable without a token so
               # consumers can fetch the keys before minting one.
