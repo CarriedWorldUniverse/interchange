@@ -47,13 +47,24 @@ type Config struct {
 	//   "/ledger" -> "http://ledger:8080"
 	// The matched prefix is stripped before proxying. Longest prefix wins.
 	Routes map[string]string
+	// PublicPaths lists gateway-side request paths that skip bearer-token
+	// verification. Entries ending in "/" match any path under that prefix
+	// (e.g. "/herald/.well-known/" matches "/herald/.well-known/openid-
+	// configuration"); other entries match exactly. Routing, anti-spoof
+	// header stripping, and prefix stripping all still apply — only auth
+	// is skipped. Use this to expose discovery endpoints (OIDC JWKS,
+	// /.well-known/openid-configuration) that consumers need before they
+	// can mint a token.
+	PublicPaths []string
 }
 
 // Gateway is the configured proxy.
 type Gateway struct {
-	bypass bool
-	verify Verifier
-	routes []route // sorted longest-prefix-first
+	bypass   bool
+	verify   Verifier
+	routes   []route // sorted longest-prefix-first
+	publicEx map[string]struct{}
+	publicPx []string // entries that ended with "/"
 }
 
 type route struct {
@@ -74,7 +85,22 @@ func New(cfg Config) (*Gateway, error) {
 	if !cfg.AuthBypass && cfg.Verifier == nil {
 		return nil, errors.New("gateway: Verifier required when AuthBypass is false")
 	}
-	g := &Gateway{bypass: cfg.AuthBypass, verify: cfg.Verifier}
+	g := &Gateway{
+		bypass:   cfg.AuthBypass,
+		verify:   cfg.Verifier,
+		publicEx: map[string]struct{}{},
+	}
+	for _, p := range cfg.PublicPaths {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if strings.HasSuffix(p, "/") {
+			g.publicPx = append(g.publicPx, p)
+		} else {
+			g.publicEx[p] = struct{}{}
+		}
+	}
 	for prefix, backend := range cfg.Routes {
 		u, err := url.Parse(backend)
 		if err != nil {
@@ -118,7 +144,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del(h)
 	}
 
-	if !g.bypass {
+	if !g.bypass && !g.isPublic(r.URL.Path) {
 		tok := bearer(r)
 		if tok == "" {
 			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
@@ -135,6 +161,20 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 	// Rewrite the path: strip the matched prefix before proxying.
 	r.URL.Path = rest
 	rt.proxy.ServeHTTP(w, r)
+}
+
+// isPublic reports whether path is configured to skip auth. Exact matches
+// take priority; otherwise any entry ending in "/" matches as a prefix.
+func (g *Gateway) isPublic(path string) bool {
+	if _, ok := g.publicEx[path]; ok {
+		return true
+	}
+	for _, p := range g.publicPx {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // match finds the longest-prefix route for path and returns it plus the

@@ -13,7 +13,18 @@
 //	INTERCHANGE_ROUTES         "prefix=backend,prefix=backend,..." e.g.
 //	                           "/herald=http://herald:8099,/ledger=http://ledger:8080"
 //	INTERCHANGE_HERALD_ISSUER  herald issuer URL (required unless bypass) — for JWKS verify
+//	INTERCHANGE_HERALD_JWKS_URL optional override pointing heraldauth at an
+//	                           internal JWKS endpoint instead of going through
+//	                           discovery on the public issuer. Use this when
+//	                           the gateway is fronting its own issuer to avoid
+//	                           a boot loop calling itself, e.g.
+//	                             INTERCHANGE_HERALD_JWKS_URL=http://herald.cwb.svc:8099/jwks
 //	INTERCHANGE_AUTH_BYPASS    "1" to skip auth (mode-1 standalone)
+//	INTERCHANGE_PUBLIC_PATHS   "path,path,..." gateway-side paths that skip
+//	                           bearer-token verification (routing + anti-spoof
+//	                           still apply). Entries ending in "/" are prefix
+//	                           matches, e.g.
+//	                             "/herald/.well-known/,/herald/jwks"
 package main
 
 import (
@@ -47,19 +58,29 @@ func main() {
 		if issuer == "" {
 			log.Fatal("interchange-gateway: INTERCHANGE_HERALD_ISSUER required (or set INTERCHANGE_AUTH_BYPASS=1)")
 		}
-		hv, err := heraldauth.New(context.Background(), heraldauth.Config{Issuer: issuer})
+		hv, err := heraldauth.New(context.Background(), heraldauth.Config{
+			Issuer:  issuer,
+			JWKSURL: os.Getenv("INTERCHANGE_HERALD_JWKS_URL"),
+		})
 		if err != nil {
 			log.Fatalf("interchange-gateway: herald verifier (issuer=%s): %v", issuer, err)
 		}
 		verifier = heraldVerifier{hv}
 	}
 
-	g, err := gateway.New(gateway.Config{Verifier: verifier, AuthBypass: bypass, Routes: routes})
+	publicPaths := parsePublicPaths(os.Getenv("INTERCHANGE_PUBLIC_PATHS"))
+
+	g, err := gateway.New(gateway.Config{
+		Verifier:    verifier,
+		AuthBypass:  bypass,
+		Routes:      routes,
+		PublicPaths: publicPaths,
+	})
 	if err != nil {
 		log.Fatalf("interchange-gateway: %v", err)
 	}
 
-	log.Printf("interchange-gateway listening on %s (bypass=%v, routes=%d)", addr, bypass, len(routes))
+	log.Printf("interchange-gateway listening on %s (bypass=%v, routes=%d, public_paths=%d)", addr, bypass, len(routes), len(publicPaths))
 	if err := http.ListenAndServe(addr, g.Handler()); err != nil {
 		log.Fatalf("interchange-gateway: %v", err)
 	}
@@ -107,6 +128,21 @@ type parseError struct{ entry string }
 
 func (e *parseError) Error() string {
 	return "bad route entry (want prefix=backend): " + e.entry
+}
+
+// parsePublicPaths splits a comma-separated list into trimmed, non-empty entries.
+func parsePublicPaths(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func env(key, def string) string {

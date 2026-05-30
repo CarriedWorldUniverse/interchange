@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interchange-gateway
+  namespace: cwb
+  labels:
+    app: interchange-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: interchange-gateway
+  template:
+    metadata:
+      labels:
+        app: interchange-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: localhost/interchange-gateway:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: INTERCHANGE_ADDR
+              value: ":8080"
+            - name: INTERCHANGE_ROUTES
+              value: "/herald=http://herald.cwb.svc:8099"
+            - name: INTERCHANGE_HERALD_ISSUER
+              # Must match HERALD_ISSUER exactly — this is what the `iss`
+              # claim is checked against.
+              value: "http://dmonextreme.tail41686e.ts.net:8080/herald/"
+            - name: INTERCHANGE_HERALD_JWKS_URL
+              # Internal JWKS path — the gateway can't fetch discovery via
+              # itself before it's listening, so go direct to herald.
+              value: "http://herald.cwb.svc:8099/jwks"
+            - name: INTERCHANGE_PUBLIC_PATHS
+              # Discovery + JWKS must be reachable without a token so
+              # consumers can fetch the keys before minting one.
+              value: "/herald/.well-known/,/herald/jwks"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
