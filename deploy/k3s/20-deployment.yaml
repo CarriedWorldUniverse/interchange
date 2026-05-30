@@ -36,9 +36,11 @@ spec:
               # itself before it's listening, so go direct to herald.
               value: "http://herald.cwb.svc:8099/jwks"
             - name: INTERCHANGE_PUBLIC_PATHS
-              # Discovery + JWKS must be reachable without a token so
-              # consumers can fetch the keys before minting one.
-              value: "/herald/.well-known/,/herald/jwks"
+              # Discovery + JWKS + token-exchange must be reachable without a
+              # bearer token: discovery/JWKS so consumers can fetch keys
+              # before minting; /token because it IS the credential exchange
+              # (verifies its own assertion, not a bearer).
+              value: "/herald/.well-known/,/herald/jwks,/herald/token"
           readinessProbe:
             httpGet:
               path: /healthz
