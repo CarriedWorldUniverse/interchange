@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interchange-gateway
+  namespace: cwb
+  labels:
+    app: interchange-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: interchange-gateway
+  template:
+    metadata:
+      labels:
+        app: interchange-gateway
+    spec:
+      containers:
+        - name: gateway
+          image: localhost/interchange-gateway:dev
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: INTERCHANGE_ADDR
+              value: ":8080"
+            - name: INTERCHANGE_ROUTES
+              value: "/herald=http://herald.cwb.svc:8099"
+            - name: INTERCHANGE_HERALD_ISSUER
+              value: "http://herald.cwb.svc:8099/"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
