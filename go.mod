@@ -3,7 +3,7 @@ module github.com/CarriedWorldUniverse/interchange
 go 1.26.2
 
 require (
-	github.com/CarriedWorldUniverse/herald v0.0.0-20260530171727-a254c696f93b
+	github.com/CarriedWorldUniverse/herald v0.0.0-20260531221851-204bf0e45da6
 	golang.org/x/crypto v0.50.0
 	golang.org/x/time v0.15.0
 	modernc.org/sqlite v1.51.0

@@ -71,10 +71,11 @@ func main() {
 	publicPaths := parsePublicPaths(os.Getenv("INTERCHANGE_PUBLIC_PATHS"))
 
 	g, err := gateway.New(gateway.Config{
-		Verifier:    verifier,
-		AuthBypass:  bypass,
-		Routes:      routes,
-		PublicPaths: publicPaths,
+		Verifier:      verifier,
+		AuthBypass:    bypass,
+		Routes:        routes,
+		PublicPaths:   publicPaths,
+		RouteProducts: routeProducts,
 	})
 	if err != nil {
 		log.Fatalf("interchange-gateway: %v", err)
@@ -100,7 +101,16 @@ func (h heraldVerifier) Verify(ctx context.Context, token string) (gateway.Ident
 		Org:              id.Org,
 		ResponsibleHuman: id.ResponsibleHuman,
 		Scopes:           id.Scopes,
+		Products:         id.Products,
 	}, nil
+}
+
+// routeProducts gates each pillar prefix by its CWB product. herald is core
+// (absent → never gated). Stable platform topology, not per-deploy config.
+var routeProducts = map[string]string{
+	"/cairn":     "cairn",
+	"/ledger":    "ledger",
+	"/knowledge": "commonplace",
 }
 
 // parseRoutes parses "prefix=backend,prefix=backend" into a map.
