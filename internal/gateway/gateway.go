@@ -29,6 +29,7 @@ type Identity struct {
 	Org              string
 	ResponsibleHuman string
 	Scopes           []string
+	Products         []string
 }
 
 // Verifier verifies a bearer token and returns the caller identity. The
@@ -56,6 +57,11 @@ type Config struct {
 	// /.well-known/openid-configuration) that consumers need before they
 	// can mint a token.
 	PublicPaths []string
+	// RouteProducts maps a route prefix → the CWB product gating it (e.g.
+	// "/cairn" -> "cairn"). A prefix absent here (e.g. "/herald") is core and
+	// never gated. If a matched route has a product and the verified identity's
+	// Products does not include it, the request is 403.
+	RouteProducts map[string]string
 }
 
 // Gateway is the configured proxy.
@@ -71,12 +77,13 @@ type route struct {
 	prefix  string
 	backend *url.URL
 	proxy   *httputil.ReverseProxy
+	product string
 }
 
 // trustedHeaders are stripped from every inbound request before the gateway
 // injects its own verified values — a client must never be able to forge them.
 var trustedHeaders = []string{
-	"X-CWB-Org", "X-CWB-Subject", "X-CWB-Kind", "X-CWB-Scopes", "X-CWB-Responsible-Human",
+	"X-CWB-Org", "X-CWB-Subject", "X-CWB-Kind", "X-CWB-Scopes", "X-CWB-Responsible-Human", "X-CWB-Products",
 }
 
 // New builds a Gateway. Errors on an unparseable backend URL, or a nil
@@ -106,10 +113,12 @@ func New(cfg Config) (*Gateway, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gateway: route %q backend %q: %w", prefix, backend, err)
 		}
+		p := strings.TrimRight(prefix, "/")
 		g.routes = append(g.routes, route{
-			prefix:  strings.TrimRight(prefix, "/"),
+			prefix:  p,
 			backend: u,
 			proxy:   httputil.NewSingleHostReverseProxy(u),
+			product: cfg.RouteProducts[p],
 		})
 	}
 	// Longest prefix first so the most specific route wins.
@@ -156,6 +165,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		injectIdentity(r, id)
+		if rt.product != "" && !hasProduct(id.Products, rt.product) {
+			http.Error(w, `{"error":"product not enabled for org"}`, http.StatusForbidden)
+			return
+		}
 	}
 
 	// Rewrite the path: strip the matched prefix before proxying.
@@ -197,9 +210,19 @@ func injectIdentity(r *http.Request, id Identity) {
 	r.Header.Set("X-CWB-Subject", id.Subject)
 	r.Header.Set("X-CWB-Kind", id.Kind)
 	r.Header.Set("X-CWB-Scopes", strings.Join(id.Scopes, " "))
+	r.Header.Set("X-CWB-Products", strings.Join(id.Products, " "))
 	if id.ResponsibleHuman != "" {
 		r.Header.Set("X-CWB-Responsible-Human", id.ResponsibleHuman)
 	}
+}
+
+func hasProduct(products []string, p string) bool {
+	for _, x := range products {
+		if x == p {
+			return true
+		}
+	}
+	return false
 }
 
 func bearer(r *http.Request) string {

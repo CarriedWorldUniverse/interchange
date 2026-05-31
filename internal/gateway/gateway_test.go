@@ -344,6 +344,50 @@ func TestPublicPaths_WithoutMatchingRouteStill404(t *testing.T) {
 	}
 }
 
+func TestGateway_DisabledProduct403(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	g, err := gateway.New(gateway.Config{
+		Verifier:      fakeVerifier{id: gateway.Identity{Org: "o1", Subject: "s1", Kind: "agent", Products: []string{"ledger"}}},
+		Routes:        map[string]string{"/cairn": backend.URL, "/ledger": backend.URL, "/herald": backend.URL},
+		RouteProducts: map[string]string{"/cairn": "cairn", "/ledger": "ledger"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(g.Handler())
+	t.Cleanup(srv.Close)
+
+	if code := getCode(t, srv.URL+"/cairn/x", "tok"); code != 403 {
+		t.Fatalf("/cairn (disabled) = %d, want 403", code)
+	}
+	if code := getCode(t, srv.URL+"/ledger/x", "tok"); code != 200 {
+		t.Fatalf("/ledger (enabled) = %d, want 200", code)
+	}
+	if code := getCode(t, srv.URL+"/herald/x", "tok"); code != 200 {
+		t.Fatalf("/herald (core, unmapped) = %d, want 200", code)
+	}
+}
+
+// getCode issues a GET with Authorization: Bearer <bearer> and returns the status code.
+func getCode(t *testing.T, url, bearer string) int {
+	t.Helper()
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		t.Fatalf("getCode NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("getCode Do: %v", err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
 func TestRoute_LongestPrefixWins(t *testing.T) {
 	b1 := echoBackend(t)
 	defer b1.Close()
