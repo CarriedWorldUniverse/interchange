@@ -11,9 +11,9 @@
 //
 //	INTERCHANGE_ADDR                listen addr (default :8080)
 //	INTERCHANGE_ROUTES              "prefix=backend,prefix=backend,..." e.g.
-//	                                "/herald=http://herald:8099,/ledger=http://ledger:8080"
-//	                                Note: /knowledge is NOT listed here; it is handled via
-//	                                grpc-gateway translation to commonplace (see below).
+//	                                "/herald=http://herald:8099,/cairn=http://cairn:3000"
+//	                                Note: /knowledge and /ledger are NOT listed here; they
+//	                                are handled via grpc-gateway translation (see below).
 //	INTERCHANGE_HERALD_ISSUER       herald issuer URL (required unless bypass) — for JWKS verify
 //	INTERCHANGE_HERALD_JWKS_URL     optional override pointing heraldauth at an
 //	                                internal JWKS endpoint instead of going through
@@ -29,9 +29,11 @@
 //	                                  "/herald/.well-known/,/herald/jwks"
 //	INTERCHANGE_COMMONPLACE_GRPC    commonplace gRPC address for grpc-gateway translation,
 //	                                e.g. "commonplace.cwb.svc:50051"
+//	INTERCHANGE_LEDGER_GRPC         ledger gRPC address for grpc-gateway translation,
+//	                                e.g. "ledger.cwb.svc:50051"
 //	INTERCHANGE_TLS_CERT            interchange's mTLS client certificate (PEM)
 //	INTERCHANGE_TLS_KEY             interchange's mTLS client key (PEM)
-//	INTERCHANGE_TLS_CA              CA certificate for verifying commonplace's server cert (PEM)
+//	INTERCHANGE_TLS_CA              CA certificate for verifying pillar server certs (PEM)
 package main
 
 import (
@@ -46,6 +48,7 @@ import (
 	"github.com/CarriedWorldUniverse/interchange/internal/edge"
 	"github.com/CarriedWorldUniverse/interchange/internal/gateway"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -79,14 +82,92 @@ func main() {
 
 	publicPaths := parsePublicPaths(os.Getenv("INTERCHANGE_PUBLIC_PATHS"))
 
-	// Build grpc-gateway mux for /knowledge → commonplace gRPC translation.
-	// The gwMux WithMetadata annotator reads the verified identity stashed in
-	// the request context by authInject (via identityCtxKey) and emits it as
-	// cwb-* gRPC metadata on the outgoing call to commonplace. This is the
-	// correct mechanism: grpc-gateway calls annotators during request handling
-	// and merges their MD into the outgoing context, so identity set here
-	// safely reaches commonplace's incoming gRPC metadata.
-	gwMux := runtime.NewServeMux(
+	tlsCert := os.Getenv("INTERCHANGE_TLS_CERT")
+	tlsKey := os.Getenv("INTERCHANGE_TLS_KEY")
+	tlsCA := os.Getenv("INTERCHANGE_TLS_CA")
+
+	// -----------------------------------------------------------------------
+	// /knowledge → commonplace gRPC edge.
+	// newGRPCMux() provides the shared ServeMux config (marshaler + identity
+	// annotator) reused by all pillar gRPC edges.
+	// -----------------------------------------------------------------------
+	knowledgeMux := newGRPCMux()
+	knowledgeAddr := os.Getenv("INTERCHANGE_COMMONPLACE_GRPC")
+	if knowledgeAddr == "" {
+		knowledgeAddr = "commonplace.cwb.svc:50051"
+	}
+	knowledgeConn, err := edge.DialPillar(knowledgeAddr, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial commonplace (%s): %v", knowledgeAddr, err)
+	}
+	if err := cwbv1.RegisterKnowledgeServiceHandler(context.Background(), knowledgeMux, knowledgeConn); err != nil {
+		log.Fatalf("interchange-gateway: register knowledge handler: %v", err)
+	}
+	knowledgeHandler := authInject(knowledgeMux, verifier, "commonplace")
+
+	// -----------------------------------------------------------------------
+	// /ledger → ledger gRPC edge (Issue/Project/Org/Admin services).
+	// -----------------------------------------------------------------------
+	ledgerMux := newGRPCMux()
+	ledgerAddr := os.Getenv("INTERCHANGE_LEDGER_GRPC")
+	if ledgerAddr == "" {
+		ledgerAddr = "ledger.cwb.svc:50051"
+	}
+	ledgerConn, err := edge.DialPillar(ledgerAddr, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial ledger (%s): %v", ledgerAddr, err)
+	}
+	for _, reg := range []func(context.Context, *runtime.ServeMux, *grpc.ClientConn) error{
+		cwbv1.RegisterIssueServiceHandler,
+		cwbv1.RegisterProjectServiceHandler,
+		cwbv1.RegisterOrgServiceHandler,
+		cwbv1.RegisterAdminServiceHandler,
+	} {
+		if err := reg(context.Background(), ledgerMux, ledgerConn); err != nil {
+			log.Fatalf("interchange-gateway: register ledger handler: %v", err)
+		}
+	}
+	ledgerHandler := authInject(ledgerMux, verifier, "ledger")
+
+	if len(routes) == 0 && !bypass {
+		log.Printf("interchange-gateway: WARNING no reverse-proxy routes configured (only grpc-gateway /knowledge + /ledger)")
+	}
+
+	g, err := gateway.New(gateway.Config{
+		Verifier:      verifier,
+		AuthBypass:    bypass,
+		Routes:        routes,
+		PublicPaths:   publicPaths,
+		RouteProducts: routeProducts,
+		GRPCHandlers: map[string]http.Handler{
+			"/knowledge": knowledgeHandler,
+			"/ledger":    ledgerHandler,
+		},
+	})
+	if err != nil {
+		log.Fatalf("interchange-gateway: %v", err)
+	}
+
+	log.Printf("interchange-gateway listening on %s (bypass=%v, routes=%d, public_paths=%d)", addr, bypass, len(routes), len(publicPaths))
+	if err := http.ListenAndServe(addr, g.Handler()); err != nil {
+		log.Fatalf("interchange-gateway: %v", err)
+	}
+}
+
+// identityCtxKey is the typed key used to stash the verified edge.Identity in
+// the request context so the grpc-gateway WithMetadata annotator can read it.
+type identityCtxKey struct{}
+
+// newGRPCMux returns a runtime.ServeMux configured with the shared CWB options
+// used by every gRPC pillar edge:
+//   - JSONPb marshaler with snake_case keys and EmitUnpopulated fields.
+//   - WithMetadata annotator that reads the verified edge.Identity stashed by
+//     authInject (via identityCtxKey) and emits cwb-* gRPC metadata on the
+//     outgoing call to the pillar. grpc-gateway merges this MD into the
+//     outgoing context before dispatching, so the pillar's incoming metadata
+//     will always carry the verified identity regardless of what the client sent.
+func newGRPCMux() *runtime.ServeMux {
+	return runtime.NewServeMux(
 		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.HTTPBodyMarshaler{
 			Marshaler: &runtime.JSONPb{
 				MarshalOptions:   protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true},
@@ -114,52 +195,7 @@ func main() {
 			return md
 		}),
 	)
-
-	grpcAddr := os.Getenv("INTERCHANGE_COMMONPLACE_GRPC")
-	if grpcAddr == "" {
-		// Default for k3s deploy; can be overridden.
-		grpcAddr = "commonplace.cwb.svc:50051"
-	}
-	conn, err := edge.DialPillar(
-		grpcAddr,
-		os.Getenv("INTERCHANGE_TLS_CERT"),
-		os.Getenv("INTERCHANGE_TLS_KEY"),
-		os.Getenv("INTERCHANGE_TLS_CA"),
-	)
-	if err != nil {
-		log.Fatalf("interchange-gateway: dial commonplace (%s): %v", grpcAddr, err)
-	}
-	if err := cwbv1.RegisterKnowledgeServiceHandler(context.Background(), gwMux, conn); err != nil {
-		log.Fatalf("interchange-gateway: register knowledge handler: %v", err)
-	}
-
-	knowledgeHandler := authInject(gwMux, verifier, "commonplace")
-
-	if len(routes) == 0 && !bypass {
-		log.Printf("interchange-gateway: WARNING no reverse-proxy routes configured (only grpc-gateway /knowledge)")
-	}
-
-	g, err := gateway.New(gateway.Config{
-		Verifier:      verifier,
-		AuthBypass:    bypass,
-		Routes:        routes,
-		PublicPaths:   publicPaths,
-		RouteProducts: routeProducts,
-		GRPCHandlers:  map[string]http.Handler{"/knowledge": knowledgeHandler},
-	})
-	if err != nil {
-		log.Fatalf("interchange-gateway: %v", err)
-	}
-
-	log.Printf("interchange-gateway listening on %s (bypass=%v, routes=%d, public_paths=%d)", addr, bypass, len(routes), len(publicPaths))
-	if err := http.ListenAndServe(addr, g.Handler()); err != nil {
-		log.Fatalf("interchange-gateway: %v", err)
-	}
 }
-
-// identityCtxKey is the typed key used to stash the verified edge.Identity in
-// the request context so the grpc-gateway WithMetadata annotator can read it.
-type identityCtxKey struct{}
 
 // authInject returns an http.Handler that:
 //  1. Extracts and verifies the bearer token via v.
