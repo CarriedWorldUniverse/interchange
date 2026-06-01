@@ -26,7 +26,9 @@ spec:
             - name: INTERCHANGE_ADDR
               value: ":8080"
             - name: INTERCHANGE_ROUTES
-              value: "/herald=http://herald.cwb.svc:8099"
+              # /knowledge is NOT in this list — it is handled by the gRPC
+              # edge (INTERCHANGE_COMMONPLACE_GRPC below), not reverse-proxied.
+              value: "/herald=http://herald.cwb.svc:8099,/ledger=http://ledger.cwb.svc:8081,/cairn=http://cairn.cwb.svc:8100"
             - name: INTERCHANGE_HERALD_ISSUER
               # Must match HERALD_ISSUER exactly — this is what the `iss`
               # claim is checked against.
@@ -41,6 +43,24 @@ spec:
               # before minting; /token because it IS the credential exchange
               # (verifies its own assertion, not a bearer).
               value: "/herald/.well-known/,/herald/jwks,/herald/token"
+            # gRPC edge — /knowledge requests are translated to gRPC calls
+            # against commonplace using the interchange-client-tls mTLS cert.
+            - name: INTERCHANGE_COMMONPLACE_GRPC
+              value: "commonplace.cwb.svc:8101"
+            # mTLS client cert for gRPC calls to commonplace.
+            # cert-manager populates interchange-client-tls from 05-certs.yaml
+            # in the commonplace repo.
+            - name: INTERCHANGE_TLS_CERT
+              value: "/etc/cwb/tls/tls.crt"
+            - name: INTERCHANGE_TLS_KEY
+              value: "/etc/cwb/tls/tls.key"
+            - name: INTERCHANGE_TLS_CA
+              value: "/etc/cwb/tls/ca.crt"
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/cwb/tls
+              readOnly: true
+          # Interchange itself stays plain HTTP on :8080 — probes unchanged.
           readinessProbe:
             httpGet:
               path: /healthz
@@ -53,3 +73,7 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 15
+      volumes:
+        - name: tls
+          secret:
+            secretName: interchange-client-tls
