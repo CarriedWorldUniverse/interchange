@@ -1,0 +1,17 @@
+# PodDisruptionBudget for interchange-gateway (NEX-428).
+# Keeps at least one gateway pod serving during voluntary disruptions
+# (node drain, rolling update, eviction) so the single public entry point
+# is never taken fully down. With replicas:2, minAvailable:1 permits one
+# pod to be disrupted at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: interchange-gateway
+  namespace: cwb
+  labels:
+    app: interchange-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: interchange-gateway
