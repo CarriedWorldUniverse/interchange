@@ -6,7 +6,19 @@ metadata:
   labels:
     app: interchange-gateway
 spec:
-  replicas: 1
+  # ≥2 replicas removes the single-pod SPOF (NEX-428). interchange is
+  # stateless (verifies the herald JWT locally against JWKS, injects the
+  # X-CWB-* / cwb-* identity) so it scales horizontally with no coordination.
+  # On single-node dMon both replicas land on the one node — this protects
+  # against pod crash + rolling updates, NOT node failure (replicas can't on
+  # one node). Rollout surges a new pod up before any old pod goes down so
+  # the gateway is never fully unavailable.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: interchange-gateway
@@ -19,6 +31,19 @@ spec:
         - name: gateway
           image: localhost/interchange-gateway:dev
           imagePullPolicy: Never
+          # Bounded so a traffic burst (e.g. CI git fan-out proxied through
+          # here) can't starve node neighbours (NEX-428). interchange is a
+          # streaming proxy + local JWT verify — light CPU, low memory (it
+          # does NOT buffer git pack bodies). Requests are modest; limits
+          # leave headroom for throughput bursts. No WriteTimeout is set on
+          # the server precisely so long git clones aren't cut off.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
           ports:
             - name: http
               containerPort: 8080
