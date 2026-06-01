@@ -44,12 +44,15 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	cairnv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/cairn/v1"
 	cwbv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/v1"
 	"github.com/CarriedWorldUniverse/herald/heraldauth"
 	"github.com/CarriedWorldUniverse/interchange/internal/edge"
@@ -136,8 +139,46 @@ func main() {
 	}
 	ledgerHandler := authInject(ledgerMux, verifier, "ledger")
 
+	// -----------------------------------------------------------------------
+	// /cairn → COMPOSITE edge. cairn is dual-transport: its JSON API is gRPC,
+	// but git Smart-HTTP stays plain HTTP (git can't be gRPC). One handler
+	// auths once, then path-splits: /api/... → grpc-gateway (mTLS to cairn's
+	// gRPC), everything else (the .git Smart-HTTP paths) → reverse-proxy to
+	// cairn's HTTP backend with X-CWB-* injected. The git backend URL is reused
+	// from the existing /cairn reverse-proxy route, which we remove from the
+	// plain Routes so /cairn is owned by the composite handler alone.
+	// -----------------------------------------------------------------------
+	cairnGRPC := os.Getenv("INTERCHANGE_CAIRN_GRPC")
+	if cairnGRPC == "" {
+		cairnGRPC = "cairn.cwb.svc:8102"
+	}
+	cairnHTTP := routes["/cairn"]
+	if cairnHTTP == "" {
+		cairnHTTP = "http://cairn.cwb.svc:8100"
+	}
+	delete(routes, "/cairn")
+	cairnConn, err := edge.DialPillar(cairnGRPC, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial cairn (%s): %v", cairnGRPC, err)
+	}
+	cairnMux := newGRPCMux()
+	for _, reg := range []func(context.Context, *runtime.ServeMux, *grpc.ClientConn) error{
+		cairnv1.RegisterRepoServiceHandler,
+		cairnv1.RegisterPullServiceHandler,
+		cairnv1.RegisterOrgServiceHandler,
+	} {
+		if err := reg(context.Background(), cairnMux, cairnConn); err != nil {
+			log.Fatalf("interchange-gateway: register cairn handler: %v", err)
+		}
+	}
+	cairnGitURL, err := url.Parse(cairnHTTP)
+	if err != nil {
+		log.Fatalf("interchange-gateway: cairn http backend %q: %v", cairnHTTP, err)
+	}
+	cairnHandler := cairnComposite(cairnMux, httputil.NewSingleHostReverseProxy(cairnGitURL), verifier, "cairn")
+
 	if len(routes) == 0 && !bypass {
-		log.Printf("interchange-gateway: WARNING no reverse-proxy routes configured (only grpc-gateway /knowledge + /ledger)")
+		log.Printf("interchange-gateway: WARNING no reverse-proxy routes configured (only grpc-gateway edges)")
 	}
 
 	g, err := gateway.New(gateway.Config{
@@ -149,6 +190,7 @@ func main() {
 		GRPCHandlers: map[string]http.Handler{
 			"/knowledge": knowledgeHandler,
 			"/ledger":    ledgerHandler,
+			"/cairn":     cairnHandler,
 		},
 	})
 	if err != nil {
@@ -297,6 +339,87 @@ func authInject(next http.Handler, v gateway.Verifier, product string) http.Hand
 		ctx := context.WithValue(r.Context(), identityCtxKey{}, id)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// cairnComposite is the dual-transport /cairn edge. It authenticates the
+// bearer token ONCE (and checks product entitlement), strips any client-forged
+// identity headers, then dispatches by path:
+//   - /api/... → the gRPC-gateway mux (apiMux). The verified identity is stashed
+//     in context so the WithMetadata annotator emits cwb-* metadata to cairn's
+//     gRPC server over mTLS.
+//   - everything else (the .git Smart-HTTP paths) → the git reverse-proxy with
+//     the verified X-CWB-* headers injected (cairn's HTTP git lane is
+//     header-trust, like every reverse-proxied pillar).
+//
+// The outer gateway dispatches gRPC-mode routes WITHOUT its own bearer-verify /
+// header-strip, so this handler owns auth + anti-spoof for BOTH lanes.
+func cairnComposite(apiMux, gitProxy http.Handler, v gateway.Verifier, product string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := bearer(r)
+		if tok == "" {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		var gid gateway.Identity
+		if v != nil {
+			var err error
+			gid, err = v.Verify(r.Context(), tok)
+			if err != nil {
+				http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		id := edge.Identity{
+			Subject:          gid.Subject,
+			Kind:             gid.Kind,
+			Org:              gid.Org,
+			ResponsibleHuman: gid.ResponsibleHuman,
+			Scopes:           gid.Scopes,
+			Products:         gid.Products,
+		}
+		if !edge.HasProduct(id, product) {
+			http.Error(w, `{"error":"product not enabled for org"}`, http.StatusForbidden)
+			return
+		}
+		stripSpoofedIdentity(r)
+
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			// API lane → cairn gRPC (identity carried as gRPC metadata).
+			ctx := context.WithValue(r.Context(), identityCtxKey{}, id)
+			apiMux.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		// git lane → cairn HTTP (identity carried as trusted X-CWB-* headers).
+		injectCWBHeaders(r, id)
+		gitProxy.ServeHTTP(w, r)
+	})
+}
+
+// stripSpoofedIdentity removes any client-supplied identity headers — both the
+// gRPC-style cwb-*/Grpc-Metadata-cwb-* (API lane) and the X-CWB-* HTTP headers
+// (git lane) — so neither lane can be spoofed before the gateway injects the
+// verified values.
+func stripSpoofedIdentity(r *http.Request) {
+	for _, k := range []string{"cwb-org", "cwb-subject", "cwb-kind", "cwb-scopes", "cwb-products", "cwb-responsible-human"} {
+		r.Header.Del(k)
+		r.Header.Del("Grpc-Metadata-" + k)
+	}
+	for _, k := range []string{"X-CWB-Org", "X-CWB-Subject", "X-CWB-Kind", "X-CWB-Scopes", "X-CWB-Products", "X-CWB-Responsible-Human"} {
+		r.Header.Del(k)
+	}
+}
+
+// injectCWBHeaders sets the verified identity as X-CWB-* headers for the git
+// reverse-proxy lane (cairn's handleGit reads these).
+func injectCWBHeaders(r *http.Request, id edge.Identity) {
+	r.Header.Set("X-CWB-Org", id.Org)
+	r.Header.Set("X-CWB-Subject", id.Subject)
+	r.Header.Set("X-CWB-Kind", id.Kind)
+	r.Header.Set("X-CWB-Scopes", strings.Join(id.Scopes, " "))
+	r.Header.Set("X-CWB-Products", strings.Join(id.Products, " "))
+	if id.ResponsibleHuman != "" {
+		r.Header.Set("X-CWB-Responsible-Human", id.ResponsibleHuman)
+	}
 }
 
 // bearer extracts the token from "Authorization: Bearer <token>".

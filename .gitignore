@@ -10,3 +10,4 @@ dist/
 /cmd/interchange-gateway/interchange-gateway
 /cmd/interchange/interchange
 *.test
+/interchange-gateway

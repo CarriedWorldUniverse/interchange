@@ -7,9 +7,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"testing"
 
+	cairnv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/cairn/v1"
 	cwbv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/v1"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/grpc"
@@ -584,5 +587,229 @@ func TestLedgerHandler_MissingProduct403(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("missing-product status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cairn composite-edge tests (Phase 3, step 3): one handler, two lanes —
+// /api/... → cairn gRPC; .git → reverse-proxy to cairn HTTP.
+// ---------------------------------------------------------------------------
+
+// stubCairnRepoSrv records the incoming gRPC metadata + method for the API lane.
+type stubCairnRepoSrv struct {
+	cairnv1.UnimplementedRepoServiceServer
+	lastMD     metadata.MD
+	lastMethod string
+}
+
+func (s *stubCairnRepoSrv) CreateRepo(ctx context.Context, req *cairnv1.CreateRepoRequest) (*cairnv1.CreateRepoResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "CreateRepo"
+	return &cairnv1.CreateRepoResponse{Repo: &cairnv1.Repo{Id: "r1", Org: req.GetOrg(), Slug: req.GetSlug(), DefaultBranch: "main"}}, nil
+}
+
+// gitRec records the last request the stub git backend received.
+type gitRec struct {
+	path string
+	hdr  http.Header
+}
+
+func newGitBackend(t *testing.T, rec *gitRec) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.path = r.URL.Path
+		rec.hdr = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func buildCairnHandler(t *testing.T, repoStub cairnv1.RepoServiceServer, gitBackend string, v gateway.Verifier) http.Handler {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	cairnv1.RegisterRepoServiceServer(grpcSrv, repoStub)
+	cairnv1.RegisterPullServiceServer(grpcSrv, &cairnv1.UnimplementedPullServiceServer{})
+	cairnv1.RegisterOrgServiceServer(grpcSrv, &cairnv1.UnimplementedOrgServiceServer{})
+	go grpcSrv.Serve(lis)
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial stub: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	cairnMux := newGRPCMux()
+	for _, reg := range []func(context.Context, *runtime.ServeMux, *grpc.ClientConn) error{
+		cairnv1.RegisterRepoServiceHandler,
+		cairnv1.RegisterPullServiceHandler,
+		cairnv1.RegisterOrgServiceHandler,
+	} {
+		if err := reg(context.Background(), cairnMux, conn); err != nil {
+			t.Fatalf("register cairn handler: %v", err)
+		}
+	}
+	gitURL, err := url.Parse(gitBackend)
+	if err != nil {
+		t.Fatalf("git backend url: %v", err)
+	}
+	return cairnComposite(cairnMux, httputil.NewSingleHostReverseProxy(gitURL), v, "cairn")
+}
+
+func validCairnIdentity() stubVerifier {
+	return stubVerifier{id: gateway.Identity{
+		Subject:  "agent-cairn",
+		Kind:     "agent",
+		Org:      "org-cairn",
+		Scopes:   []string{"repo:read", "repo:write"},
+		Products: []string{"cairn"},
+	}}
+}
+
+// TestCairnComposite_APILaneToGRPC: /api/... reaches the cairn gRPC server with
+// the verified identity as cwb-* metadata.
+func TestCairnComposite_APILaneToGRPC(t *testing.T) {
+	repoStub := &stubCairnRepoSrv{}
+	git := newGitBackend(t, &gitRec{})
+	h := buildCairnHandler(t, repoStub, git.URL, validCairnIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/orgs/org-cairn/repos", strings.NewReader(`{"slug":"widgets"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("API lane status = %d, body = %s", resp.StatusCode, b)
+	}
+	if repoStub.lastMethod != "CreateRepo" {
+		t.Errorf("lastMethod = %q, want CreateRepo", repoStub.lastMethod)
+	}
+	if got := repoStub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "org-cairn" {
+		t.Errorf("cwb-org metadata = %v, want [org-cairn]", got)
+	}
+	if got := repoStub.lastMD.Get("cwb-subject"); len(got) != 1 || got[0] != "agent-cairn" {
+		t.Errorf("cwb-subject metadata = %v, want [agent-cairn]", got)
+	}
+}
+
+// TestCairnComposite_GitLaneToReverseProxy: a .git path reaches the HTTP git
+// backend with the verified X-CWB-* headers injected.
+func TestCairnComposite_GitLaneToReverseProxy(t *testing.T) {
+	rec := &gitRec{}
+	git := newGitBackend(t, rec)
+	h := buildCairnHandler(t, &stubCairnRepoSrv{}, git.URL, validCairnIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/org-cairn/widgets.git/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("git lane status = %d", resp.StatusCode)
+	}
+	if rec.path != "/org-cairn/widgets.git/info/refs" {
+		t.Errorf("git backend path = %q, want /org-cairn/widgets.git/info/refs", rec.path)
+	}
+	if rec.hdr.Get("X-CWB-Subject") != "agent-cairn" || rec.hdr.Get("X-CWB-Org") != "org-cairn" {
+		t.Errorf("git backend X-CWB-* = subj %q org %q, want agent-cairn/org-cairn",
+			rec.hdr.Get("X-CWB-Subject"), rec.hdr.Get("X-CWB-Org"))
+	}
+	if rec.hdr.Get("X-CWB-Scopes") != "repo:read repo:write" {
+		t.Errorf("git backend X-CWB-Scopes = %q", rec.hdr.Get("X-CWB-Scopes"))
+	}
+}
+
+// TestCairnComposite_NoToken401: both lanes require a bearer token.
+func TestCairnComposite_NoToken401(t *testing.T) {
+	git := newGitBackend(t, &gitRec{})
+	h := buildCairnHandler(t, &stubCairnRepoSrv{}, git.URL, validCairnIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	for _, path := range []string{"/api/orgs/org-cairn/repos", "/org-cairn/widgets.git/info/refs"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s no-token status = %d, want 401", path, resp.StatusCode)
+		}
+	}
+}
+
+// TestCairnComposite_MissingProduct403: a token without the cairn product is 403.
+func TestCairnComposite_MissingProduct403(t *testing.T) {
+	git := newGitBackend(t, &gitRec{})
+	v := stubVerifier{id: gateway.Identity{Subject: "a", Org: "o", Products: []string{"ledger"}}}
+	h := buildCairnHandler(t, &stubCairnRepoSrv{}, git.URL, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	req, _ := http.NewRequest("POST", srv.URL+"/api/orgs/o/repos", strings.NewReader(`{"slug":"x"}`))
+	req.Header.Set("Authorization", "Bearer t")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("missing-product status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// TestCairnComposite_SpoofStripped: client-forged identity headers are stripped
+// on BOTH lanes — the backends see only the verified identity.
+func TestCairnComposite_SpoofStripped(t *testing.T) {
+	// git lane: a forged X-CWB-Subject must not reach the backend.
+	rec := &gitRec{}
+	git := newGitBackend(t, rec)
+	h := buildCairnHandler(t, &stubCairnRepoSrv{}, git.URL, validCairnIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/org-cairn/widgets.git/info/refs", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("X-CWB-Subject", "evil")
+	req.Header.Set("X-CWB-Org", "evil-org")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if rec.hdr.Get("X-CWB-Subject") != "agent-cairn" || rec.hdr.Get("X-CWB-Org") != "org-cairn" {
+		t.Errorf("spoof leaked to git backend: subj %q org %q", rec.hdr.Get("X-CWB-Subject"), rec.hdr.Get("X-CWB-Org"))
+	}
+
+	// API lane: a forged Grpc-Metadata-cwb-org must not reach the gRPC server.
+	repoStub := &stubCairnRepoSrv{}
+	h2 := buildCairnHandler(t, repoStub, git.URL, validCairnIdentity())
+	srv2 := httptest.NewServer(h2)
+	defer srv2.Close()
+	req2, _ := http.NewRequest("POST", srv2.URL+"/api/orgs/org-cairn/repos", strings.NewReader(`{"slug":"w"}`))
+	req2.Header.Set("Authorization", "Bearer valid-token")
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Grpc-Metadata-cwb-org", "evil-org")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if got := repoStub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "org-cairn" {
+		t.Errorf("spoof leaked to gRPC: cwb-org = %v, want [org-cairn]", got)
 	}
 }
