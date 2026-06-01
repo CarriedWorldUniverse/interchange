@@ -408,3 +408,181 @@ func TestKnowledgeHandler_GetByIdNotHTTPRouted(t *testing.T) {
 		t.Error("stub.lastMethod = \"Get\": HTTP Get route should not exist (grpc-gateway binding was removed)")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Ledger routing regression tests (Step 1 — test-first for Phase 2)
+// ---------------------------------------------------------------------------
+
+// stubIssueServiceSrv is a minimal IssueServiceServer that records which RPC
+// was last invoked. Used to assert literal-path routes (/search, /my) beat
+// the {key} wildcard in GetIssue.
+type stubIssueServiceSrv struct {
+	cwbv1.UnimplementedIssueServiceServer
+	lastMethod string
+}
+
+func (s *stubIssueServiceSrv) GetIssue(_ context.Context, req *cwbv1.GetIssueRequest) (*cwbv1.GetIssueResponse, error) {
+	s.lastMethod = "GetIssue"
+	return &cwbv1.GetIssueResponse{}, nil
+}
+
+func (s *stubIssueServiceSrv) SearchIssues(_ context.Context, _ *cwbv1.SearchIssuesRequest) (*cwbv1.SearchIssuesResponse, error) {
+	s.lastMethod = "SearchIssues"
+	return &cwbv1.SearchIssuesResponse{}, nil
+}
+
+func (s *stubIssueServiceSrv) ListMyIssues(_ context.Context, _ *cwbv1.ListMyIssuesRequest) (*cwbv1.ListMyIssuesResponse, error) {
+	s.lastMethod = "ListMyIssues"
+	return &cwbv1.ListMyIssuesResponse{}, nil
+}
+
+// buildLedgerHandler constructs a ledger handler stack identical to the
+// production wiring but using an in-process insecure gRPC server. All four
+// ledger service handlers are registered on a shared ServeMux to match prod.
+func buildLedgerHandler(t *testing.T, stub *stubIssueServiceSrv, v gateway.Verifier) http.Handler {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	cwbv1.RegisterIssueServiceServer(grpcSrv, stub)
+	// ProjectService, OrgService, AdminService use their unimplemented stubs —
+	// we only need IssueService to respond for these routing tests.
+	cwbv1.RegisterProjectServiceServer(grpcSrv, &cwbv1.UnimplementedProjectServiceServer{})
+	cwbv1.RegisterOrgServiceServer(grpcSrv, &cwbv1.UnimplementedOrgServiceServer{})
+	cwbv1.RegisterAdminServiceServer(grpcSrv, &cwbv1.UnimplementedAdminServiceServer{})
+	go grpcSrv.Serve(lis)
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial stub: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	ledgerMux := newGRPCMux()
+	for _, reg := range []func(context.Context, *runtime.ServeMux, *grpc.ClientConn) error{
+		cwbv1.RegisterIssueServiceHandler,
+		cwbv1.RegisterProjectServiceHandler,
+		cwbv1.RegisterOrgServiceHandler,
+		cwbv1.RegisterAdminServiceHandler,
+	} {
+		if err := reg(context.Background(), ledgerMux, conn); err != nil {
+			t.Fatalf("register ledger handler: %v", err)
+		}
+	}
+
+	return authInject(ledgerMux, v, "ledger")
+}
+
+// validLedgerIdentity returns a stubVerifier whose identity has the "ledger" product.
+func validLedgerIdentity() stubVerifier {
+	return stubVerifier{id: gateway.Identity{
+		Subject:  "agent-ledger-test",
+		Kind:     "agent",
+		Org:      "org-ledger-test",
+		Scopes:   []string{"issues:read"},
+		Products: []string{"ledger"},
+	}}
+}
+
+// TestLedgerHandler_SearchNotShadowedByGet is the key routing regression guard:
+// POST /api/issues/search must dispatch to SearchIssues, NOT to GetIssue with
+// key="search". This is the literal-vs-{key} collision that bit /knowledge.
+func TestLedgerHandler_SearchNotShadowedByGet(t *testing.T) {
+	stub := &stubIssueServiceSrv{}
+	h := buildLedgerHandler(t, stub, validLedgerIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/issues/search", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/issues/search status = %d, body = %s", resp.StatusCode, b)
+	}
+	if stub.lastMethod != "SearchIssues" {
+		t.Errorf("stub.lastMethod = %q, want \"SearchIssues\" (literal /search must beat {key} wildcard)", stub.lastMethod)
+	}
+}
+
+// TestLedgerHandler_ListMyIssues verifies that GET /api/issues/my routes to
+// ListMyIssues, not GetIssue(key="my").
+func TestLedgerHandler_ListMyIssues(t *testing.T) {
+	stub := &stubIssueServiceSrv{}
+	h := buildLedgerHandler(t, stub, validLedgerIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/issues/my", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/issues/my status = %d, body = %s", resp.StatusCode, b)
+	}
+	if stub.lastMethod != "ListMyIssues" {
+		t.Errorf("stub.lastMethod = %q, want \"ListMyIssues\"", stub.lastMethod)
+	}
+}
+
+// TestLedgerHandler_NoToken401 verifies missing bearer token → 401 on the ledger edge.
+func TestLedgerHandler_NoToken401(t *testing.T) {
+	stub := &stubIssueServiceSrv{}
+	h := buildLedgerHandler(t, stub, validLedgerIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/issues/search", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	// No Authorization header.
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestLedgerHandler_MissingProduct403 verifies token without "ledger" product → 403.
+func TestLedgerHandler_MissingProduct403(t *testing.T) {
+	stub := &stubIssueServiceSrv{}
+	v := stubVerifier{id: gateway.Identity{
+		Subject:  "agent-x",
+		Org:      "org-y",
+		Products: []string{"cairn", "commonplace"}, // no "ledger"
+	}}
+	h := buildLedgerHandler(t, stub, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/issues/search", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer some-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("missing-product status = %d, want 403", resp.StatusCode)
+	}
+}
