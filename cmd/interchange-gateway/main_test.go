@@ -27,12 +27,14 @@ import (
 
 type stubKnowledgeSrv struct {
 	cwbv1.UnimplementedKnowledgeServiceServer
-	lastMD metadata.MD
+	lastMD     metadata.MD
+	lastMethod string // records which RPC was last invoked
 }
 
 func (s *stubKnowledgeSrv) Store(ctx context.Context, req *cwbv1.StoreRequest) (*cwbv1.StoreResponse, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	s.lastMD = md
+	s.lastMethod = "Store"
 	return &cwbv1.StoreResponse{
 		Entry: &cwbv1.Entry{
 			Id:      "entry-1",
@@ -40,6 +42,20 @@ func (s *stubKnowledgeSrv) Store(ctx context.Context, req *cwbv1.StoreRequest) (
 			Content: req.GetContent(),
 		},
 	}, nil
+}
+
+func (s *stubKnowledgeSrv) Search(ctx context.Context, req *cwbv1.SearchRequest) (*cwbv1.SearchResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "Search"
+	return &cwbv1.SearchResponse{Hits: []*cwbv1.Hit{}}, nil
+}
+
+func (s *stubKnowledgeSrv) Get(ctx context.Context, req *cwbv1.GetRequest) (*cwbv1.GetResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "Get"
+	return &cwbv1.GetResponse{Entry: &cwbv1.Entry{Id: req.GetId()}}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -313,5 +329,82 @@ func TestParseRoutes_Bad(t *testing.T) {
 		if _, err := parseRoutes(bad); err == nil {
 			t.Errorf("parseRoutes(%q) should error", bad)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Routing regression: GET /api/knowledge/search must route to Search, not Get.
+// Before the fix, grpc-gateway matched the {id} wildcard first, routing
+// GET /api/knowledge/search to Get(id="search") → NotFound → 404.
+// ---------------------------------------------------------------------------
+
+// validCommonplaceIdentity returns a stubVerifier whose identity has the
+// "commonplace" product so it passes authInject.
+func validCommonplaceIdentity() stubVerifier {
+	return stubVerifier{id: gateway.Identity{
+		Subject:  "agent-route-test",
+		Kind:     "agent",
+		Org:      "org-route-test",
+		Scopes:   []string{"kb:read"},
+		Products: []string{"commonplace"},
+	}}
+}
+
+// TestKnowledgeHandler_SearchNotShadowedByGet proves that the literal path
+// /api/knowledge/search routes to the Search RPC, not to Get(id="search").
+// This is the definitive regression guard for the grpc-gateway route collision.
+func TestKnowledgeHandler_SearchNotShadowedByGet(t *testing.T) {
+	stub := &stubKnowledgeSrv{}
+	h := buildKnowledgeHandler(t, stub, validCommonplaceIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/knowledge/search?q=hi&top_k=3", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/knowledge/search?q=hi&top_k=3 status = %d, body = %s", resp.StatusCode, b)
+	}
+
+	if stub.lastMethod != "Search" {
+		t.Errorf("stub.lastMethod = %q, want \"Search\" (route collision: Get shadowed Search)", stub.lastMethod)
+	}
+}
+
+// TestKnowledgeHandler_GetByIdNotHTTPRouted documents the intentional contract
+// reduction: after dropping Get's HTTP binding, GET /api/knowledge/{id}
+// (for any non-"search" id) returns 404 via the gateway.
+func TestKnowledgeHandler_GetByIdNotHTTPRouted(t *testing.T) {
+	stub := &stubKnowledgeSrv{}
+	h := buildKnowledgeHandler(t, stub, validCommonplaceIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/knowledge/some-entry-id", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Get is gRPC-only; no HTTP binding → grpc-gateway returns 404 or 501
+	// (Method Not Allowed) depending on whether other methods match the path
+	// segment. Either is acceptable; what matters is it is NOT 200.
+	if resp.StatusCode == http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /api/knowledge/some-entry-id status = 200, want non-200 (Get is gRPC-only), body = %s", b)
+	}
+	// Also assert Get was NOT invoked (no HTTP route should reach it).
+	if stub.lastMethod == "Get" {
+		t.Error("stub.lastMethod = \"Get\": HTTP Get route should not exist (grpc-gateway binding was removed)")
 	}
 }
