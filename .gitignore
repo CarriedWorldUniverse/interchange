@@ -5,7 +5,8 @@ dist/
 *.log
 .DS_Store
 /bin/
-# Build artifacts — never commit compiled binaries
-interchange-gateway
+# Build artifacts — never commit compiled binaries. Use anchored paths so the
+# bare binary name doesn't also ignore the cmd/interchange-gateway/ directory.
 /cmd/interchange-gateway/interchange-gateway
+/cmd/interchange/interchange
 *.test

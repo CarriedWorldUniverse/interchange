@@ -34,14 +34,21 @@
 //	INTERCHANGE_TLS_CERT            interchange's mTLS client certificate (PEM)
 //	INTERCHANGE_TLS_KEY             interchange's mTLS client key (PEM)
 //	INTERCHANGE_TLS_CA              CA certificate for verifying pillar server certs (PEM)
+//	INTERCHANGE_SHUTDOWN_TIMEOUT    graceful-shutdown drain timeout on SIGTERM/SIGINT
+//	                                (Go duration, default "25s"; keep under the k8s
+//	                                terminationGracePeriod)
 package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	cwbv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/v1"
 	"github.com/CarriedWorldUniverse/herald/heraldauth"
@@ -148,10 +155,51 @@ func main() {
 		log.Fatalf("interchange-gateway: %v", err)
 	}
 
-	log.Printf("interchange-gateway listening on %s (bypass=%v, routes=%d, public_paths=%d)", addr, bypass, len(routes), len(publicPaths))
-	if err := http.ListenAndServe(addr, g.Handler()); err != nil {
+	srv := &http.Server{Addr: addr, Handler: g.Handler()}
+
+	// Graceful shutdown: on SIGTERM/SIGINT stop accepting new connections and
+	// let in-flight requests drain, bounded by INTERCHANGE_SHUTDOWN_TIMEOUT
+	// (default 25s — kept under k8s's default 30s terminationGracePeriod so
+	// Shutdown completes before SIGKILL). A long git clone/push still streaming
+	// at the deadline is cut, but ordinary requests finish cleanly and the pod
+	// exits 0 — no more spurious "Error" status on terminating pods during a
+	// rolling update (NEX-428 follow-up).
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("interchange-gateway listening on %s (bypass=%v, routes=%d, public_paths=%d)", addr, bypass, len(routes), len(publicPaths))
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
 		log.Fatalf("interchange-gateway: %v", err)
+	case <-ctx.Done():
+		stop() // restore default handling so a second signal force-kills
+		log.Printf("interchange-gateway: shutdown signal received, draining (timeout %s)…", shutdownTimeout())
+		shutCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout())
+		defer cancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			log.Fatalf("interchange-gateway: graceful shutdown failed: %v", err)
+		}
+		log.Printf("interchange-gateway: shutdown complete")
 	}
+}
+
+// shutdownTimeout is how long graceful shutdown waits for in-flight requests
+// to drain. Override with INTERCHANGE_SHUTDOWN_TIMEOUT (a Go duration, e.g.
+// "25s"); default 25s, deliberately under the k8s 30s terminationGracePeriod.
+func shutdownTimeout() time.Duration {
+	if v := os.Getenv("INTERCHANGE_SHUTDOWN_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 25 * time.Second
 }
 
 // identityCtxKey is the typed key used to stash the verified edge.Identity in
