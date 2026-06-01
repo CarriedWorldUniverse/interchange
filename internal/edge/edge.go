@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"os"
 	"strings"
 
@@ -31,6 +32,11 @@ var cwbMetaKeys = []string{
 }
 
 // StripClientMetadata removes any client-supplied cwb-* keys from md (anti-spoof).
+// This is for the Phase 1b external-gRPC proxy lane, which receives a raw gRPC
+// request and must strip client-supplied cwb-* keys from the incoming
+// metadata.MD before injecting the verified identity. It is distinct from the
+// HTTP-header strip that authInject performs for the current REST edge
+// (grpc-gateway) lane; both are required in their respective lanes.
 func StripClientMetadata(md metadata.MD) {
 	for _, k := range cwbMetaKeys {
 		md.Delete(k)
@@ -38,6 +44,10 @@ func StripClientMetadata(md metadata.MD) {
 }
 
 // OutgoingContext returns ctx carrying the verified identity as cwb-* outgoing metadata.
+// This is for the Phase 1b external-gRPC proxy lane: after stripping client
+// metadata with StripClientMetadata, call OutgoingContext to attach the verified
+// identity to the outgoing gRPC call. The current REST edge (grpc-gateway) lane
+// uses the grpc-gateway WithMetadata annotator in authInject instead.
 func OutgoingContext(ctx context.Context, id Identity) context.Context {
 	md := metadata.MD{}
 	md.Set("cwb-org", id.Org)
@@ -72,7 +82,9 @@ func DialPillar(addr, certFile, keyFile, caFile string) (*grpc.ClientConn, error
 		return nil, err
 	}
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(caPEM)
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("edge.DialPillar: no certs parsed from CA %s", caFile)
+	}
 	creds := credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,

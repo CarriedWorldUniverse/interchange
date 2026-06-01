@@ -225,6 +225,62 @@ func TestKnowledgeHandler_MissingProduct403(t *testing.T) {
 	}
 }
 
+// TestKnowledgeHandler_RejectsSpoofedIdentity proves that a client cannot forge
+// cwb-* identity by supplying spoofed HTTP headers. The stub verifier returns
+// a fixed verified identity (Org: "real-org"); even if the client sends
+// Grpc-Metadata-cwb-org, Grpc-Metadata-Cwb-Org, and cwb-org all set to
+// "evil-org", the gRPC server must see only "real-org" in cwb-org metadata —
+// exactly one value and it must be the verified one.
+func TestKnowledgeHandler_RejectsSpoofedIdentity(t *testing.T) {
+	stub := &stubKnowledgeSrv{}
+	id := gateway.Identity{
+		Subject:  "real-subject",
+		Kind:     "agent",
+		Org:      "real-org",
+		Products: []string{"commonplace"},
+	}
+	v := stubVerifier{id: id}
+
+	h := buildKnowledgeHandler(t, stub, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	body := `{"topic":"spoof-test","content":"hello"}`
+	req, _ := http.NewRequest("POST", srv.URL+"/api/knowledge", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+	// Attempt to spoof identity via all known vectors:
+	req.Header.Set("Grpc-Metadata-cwb-org", "evil-org")       // lowercase variant
+	req.Header.Set("Grpc-Metadata-Cwb-Org", "evil-org")       // canonical-case variant
+	req.Header.Set("cwb-org", "evil-org")                     // raw cwb-* header
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+
+	// The gRPC stub MUST receive cwb-org == "real-org" (the verified value).
+	got := stub.lastMD.Get("cwb-org")
+	if len(got) != 1 {
+		t.Fatalf("cwb-org metadata: got %d values %v, want exactly 1 (\"real-org\")", len(got), got)
+	}
+	if got[0] != "real-org" {
+		t.Errorf("cwb-org = %q, want \"real-org\" (client spoof should have been stripped)", got[0])
+	}
+
+	// Also assert cwb-subject is the verified value, not spoofed.
+	gotSubj := stub.lastMD.Get("cwb-subject")
+	if len(gotSubj) != 1 || gotSubj[0] != "real-subject" {
+		t.Errorf("cwb-subject = %v, want [\"real-subject\"]", gotSubj)
+	}
+}
+
 func TestParseRoutes(t *testing.T) {
 	got, err := parseRoutes("/herald=http://herald:8099, /ledger=http://ledger:8080 ,/cairn=http://cairn:3000")
 	if err != nil {

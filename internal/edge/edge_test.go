@@ -2,7 +2,17 @@ package edge_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/metadata"
 
@@ -113,4 +123,68 @@ func TestDialPillar_ErrorsOnMissingCertFile(t *testing.T) {
 	if err == nil {
 		t.Error("DialPillar should return error when cert files don't exist")
 	}
+}
+
+// TestDialPillar_ErrorsOnBadCAFile ensures DialPillar returns a clear error when the
+// CA file exists but contains no valid PEM certificate block (not a silent
+// empty pool that produces an opaque TLS handshake failure).
+func TestDialPillar_ErrorsOnBadCAFile(t *testing.T) {
+	// Write a real self-signed keypair so LoadX509KeyPair succeeds; the bad part is the CA.
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	certFile := writeTempFile(t, certPEM)
+	keyFile := writeTempFile(t, keyPEM)
+	badCAFile := writeTempFile(t, []byte("this is not a PEM certificate"))
+
+	_, err := edge.DialPillar("localhost:9999", certFile, keyFile, badCAFile)
+	if err == nil {
+		t.Fatal("DialPillar should return error for CA file with no valid certs")
+	}
+	if !strings.Contains(err.Error(), "no certs parsed") {
+		t.Errorf("error should mention 'no certs parsed', got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// writeTempFile writes b to a temp file and returns the path.
+func writeTempFile(t *testing.T, b []byte) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "edge-test-*")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	if _, err := f.Write(b); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	f.Close()
+	return f.Name()
+}
+
+// generateSelfSignedCert generates a minimal self-signed cert+key pair for tests.
+func generateSelfSignedCert(t *testing.T) (certPEM, keyPEM []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return
 }
