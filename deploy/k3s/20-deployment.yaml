@@ -51,8 +51,11 @@ spec:
             - name: INTERCHANGE_ADDR
               value: ":8080"
             - name: INTERCHANGE_ROUTES
-              # /knowledge and /ledger are NOT in this list — both are handled
-              # by gRPC edges below, not reverse-proxied.
+              # /knowledge and /ledger are NOT here — both are gRPC edges below.
+              # /cairn is a COMPOSITE edge: its /api/ lane is gRPC (see
+              # INTERCHANGE_CAIRN_GRPC) and its .git lane reverse-proxies to this
+              # cairn HTTP backend, which the gateway reads from this route then
+              # removes from the plain reverse-proxy set.
               value: "/herald=http://herald.cwb.svc:8099,/cairn=http://cairn.cwb.svc:8100"
             - name: INTERCHANGE_HERALD_ISSUER
               # Must match HERALD_ISSUER exactly — this is what the `iss`
@@ -76,6 +79,10 @@ spec:
             # it directly over mTLS using the interchange-client-tls cert.
             - name: INTERCHANGE_LEDGER_GRPC
               value: "ledger.cwb.svc:8081"
+            # gRPC edge — cairn's /api/ lane (Phase 3). The .git lane uses the
+            # /cairn reverse-proxy backend in INTERCHANGE_ROUTES above.
+            - name: INTERCHANGE_CAIRN_GRPC
+              value: "cairn.cwb.svc:8102"
             # mTLS client cert for gRPC calls to commonplace.
             # cert-manager populates interchange-client-tls from 05-certs.yaml
             # in the commonplace repo.
