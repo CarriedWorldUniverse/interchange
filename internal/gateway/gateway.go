@@ -62,6 +62,14 @@ type Config struct {
 	// never gated. If a matched route has a product and the verified identity's
 	// Products does not include it, the request is 403.
 	RouteProducts map[string]string
+	// GRPCHandlers maps a path prefix → a fully self-contained http.Handler that
+	// handles its OWN auth, translation and forwarding (e.g. a grpc-gateway mux
+	// wrapped in an authInject middleware). These routes are registered alongside
+	// the reverse-proxy Routes and matched by longest prefix. For a gRPC-mode
+	// route, the gateway strips the matched prefix and dispatches directly to the
+	// handler WITHOUT running the legacy bearer-verify / injectIdentity / product
+	// check — the handler owns all of that.
+	GRPCHandlers map[string]http.Handler
 }
 
 // Gateway is the configured proxy.
@@ -78,6 +86,10 @@ type route struct {
 	backend *url.URL
 	proxy   *httputil.ReverseProxy
 	product string
+	// handler is set for gRPC-mode routes (GRPCHandlers). When non-nil,
+	// the gateway dispatches directly to this handler (prefix stripped)
+	// without running its own bearer-verify / injectIdentity / product check.
+	handler http.Handler
 }
 
 // trustedHeaders are stripped from every inbound request before the gateway
@@ -121,6 +133,14 @@ func New(cfg Config) (*Gateway, error) {
 			product: cfg.RouteProducts[p],
 		})
 	}
+	// Register gRPC-mode handlers alongside the reverse-proxy routes.
+	for prefix, h := range cfg.GRPCHandlers {
+		p := strings.TrimRight(prefix, "/")
+		g.routes = append(g.routes, route{
+			prefix:  p,
+			handler: h,
+		})
+	}
 	// Longest prefix first so the most specific route wins.
 	sort.Slice(g.routes, func(i, j int) bool {
 		return len(g.routes[i].prefix) > len(g.routes[j].prefix)
@@ -143,6 +163,15 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 	rt, rest, ok := g.match(r.URL.Path)
 	if !ok {
 		http.Error(w, `{"error":"no route"}`, http.StatusNotFound)
+		return
+	}
+
+	// gRPC-mode routes: dispatch directly to the handler with the prefix stripped.
+	// The handler owns its own auth, identity injection, and product check.
+	// We skip the legacy bearer-verify / injectIdentity / product-gate for these.
+	if rt.handler != nil {
+		r.URL.Path = rest
+		rt.handler.ServeHTTP(w, r)
 		return
 	}
 

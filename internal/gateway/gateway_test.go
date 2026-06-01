@@ -414,3 +414,138 @@ func TestRoute_LongestPrefixWins(t *testing.T) {
 		t.Errorf("longest-prefix path = %q, want /x (matched /ledger/special)", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Dual-mode routing: GRPCHandlers
+// ---------------------------------------------------------------------------
+
+// newGatewayWithGRPC builds a Gateway with both reverse-proxy routes and gRPC handlers.
+func newGatewayWithGRPC(t *testing.T, v gateway.Verifier, routes map[string]string, grpcHandlers map[string]http.Handler) http.Handler {
+	t.Helper()
+	g, err := gateway.New(gateway.Config{
+		Verifier:     v,
+		AuthBypass:   false,
+		Routes:       routes,
+		GRPCHandlers: grpcHandlers,
+	})
+	if err != nil {
+		t.Fatalf("gateway.New: %v", err)
+	}
+	return g.Handler()
+}
+
+// TestGRPCHandler_DispatchesToHandler verifies that a prefix registered in
+// GRPCHandlers is dispatched to the provided http.Handler (prefix stripped)
+// instead of the reverse proxy.
+func TestGRPCHandler_DispatchesToHandler(t *testing.T) {
+	var receivedPath string
+	grpcStub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	})
+
+	backend := echoBackend(t)
+	defer backend.Close()
+
+	v := fakeVerifier{id: gateway.Identity{Subject: "s", Org: "o", Kind: "agent"}}
+	h := newGatewayWithGRPC(t, v,
+		map[string]string{"/ledger": backend.URL},
+		map[string]http.Handler{"/knowledge": grpcStub},
+	)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// Hit the gRPC-mode route — no Authorization header needed (handler owns auth).
+	resp, err := http.Post(srv.URL+"/knowledge/api/knowledge", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("grpc handler status = %d, want 200", resp.StatusCode)
+	}
+	// Prefix "/knowledge" must be stripped before dispatch.
+	if receivedPath != "/api/knowledge" {
+		t.Errorf("grpc handler received path = %q, want /api/knowledge", receivedPath)
+	}
+}
+
+// TestGRPCHandler_ReverseProxyRouteUnchanged verifies non-gRPC routes still
+// go through the normal bearer-verify + reverse-proxy flow.
+func TestGRPCHandler_ReverseProxyRouteUnchanged(t *testing.T) {
+	backend := echoBackend(t)
+	defer backend.Close()
+
+	grpcStub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Should NOT be called for /ledger requests.
+		t.Error("grpc handler called for /ledger route")
+	})
+
+	v := fakeVerifier{id: gateway.Identity{Subject: "s", Org: "o", Kind: "agent"}}
+	h := newGatewayWithGRPC(t, v,
+		map[string]string{"/ledger": backend.URL},
+		map[string]http.Handler{"/knowledge": grpcStub},
+	)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/ledger/api/issues", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("ledger proxy status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Echo-Path"); got != "/api/issues" {
+		t.Errorf("backend path = %q, want /api/issues", got)
+	}
+}
+
+// TestGRPCHandler_NoBearerCheckForGRPCRoute verifies the legacy bearer-verify
+// does NOT run for gRPC-mode routes (the handler owns its own auth).
+func TestGRPCHandler_NoBearerCheckForGRPCRoute(t *testing.T) {
+	called := false
+	grpcStub := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		// Handler returns 401 itself when no token — simulating handler-owned auth.
+		if r.Header.Get("Authorization") == "" {
+			http.Error(w, `{"error":"no token"}`, http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	backend := echoBackend(t)
+	defer backend.Close()
+
+	// fakeVerifier would panic (err != nil) if called — proves gateway didn't call it.
+	v := fakeVerifier{err: io.ErrUnexpectedEOF}
+	h := newGatewayWithGRPC(t, v,
+		map[string]string{"/ledger": backend.URL},
+		map[string]http.Handler{"/knowledge": grpcStub},
+	)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// No Authorization header — if gateway ran its own bearer check, it would 401
+	// before reaching the grpcStub. We want the stub's 401 (called=true), not the
+	// gateway's. Either way is 401 but we verify the stub was called.
+	resp, err := http.Get(srv.URL + "/knowledge/api/knowledge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if !called {
+		t.Error("grpc handler was not called; gateway may have short-circuited before dispatching")
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (from grpc handler)", resp.StatusCode)
+	}
+}
