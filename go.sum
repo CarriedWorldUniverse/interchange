@@ -1,7 +1,7 @@
 github.com/CarriedWorldUniverse/casket-go v0.1.0 h1:t+DvXs8vhaNcTfkSS/sqK47fBTNVRdHfF7DT/ur0jtY=
 github.com/CarriedWorldUniverse/casket-go v0.1.0/go.mod h1:v0y8kPW/WmusBw+Q3ZtRYhVwoK/WVVVXHWSc/oRVWBo=
-github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260601010944-950233dba1d7 h1:6rfVrCjls6xRWxwdVp5R3oudlhp+hJXgzLiiQCns8hQ=
-github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260601010944-950233dba1d7/go.mod h1:SBXfS7WeuwK80SZrysL1YC0oDrNlNYoXqgWKkeK80wE=
+github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260601020221-2c2eef6c19c8 h1:w6KoE7O1F6Ts1JlXeIDpXlOz3HwURZQR67DJA+D4YuQ=
+github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260601020221-2c2eef6c19c8/go.mod h1:SBXfS7WeuwK80SZrysL1YC0oDrNlNYoXqgWKkeK80wE=
 github.com/CarriedWorldUniverse/herald v0.0.0-20260531221851-204bf0e45da6 h1:qkQV3PEjKijknAY9pa/ISWqAWSRkD1qnoVNElERvNCM=
 github.com/CarriedWorldUniverse/herald v0.0.0-20260531221851-204bf0e45da6/go.mod h1:7+Jt/jpnUOxb7a1AmvJoYAQA+6BnYSsbp51afCohaPo=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
