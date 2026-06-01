@@ -9,22 +9,29 @@
 //
 // Config (env):
 //
-//	INTERCHANGE_ADDR           listen addr (default :8080)
-//	INTERCHANGE_ROUTES         "prefix=backend,prefix=backend,..." e.g.
-//	                           "/herald=http://herald:8099,/ledger=http://ledger:8080"
-//	INTERCHANGE_HERALD_ISSUER  herald issuer URL (required unless bypass) — for JWKS verify
-//	INTERCHANGE_HERALD_JWKS_URL optional override pointing heraldauth at an
-//	                           internal JWKS endpoint instead of going through
-//	                           discovery on the public issuer. Use this when
-//	                           the gateway is fronting its own issuer to avoid
-//	                           a boot loop calling itself, e.g.
-//	                             INTERCHANGE_HERALD_JWKS_URL=http://herald.cwb.svc:8099/jwks
-//	INTERCHANGE_AUTH_BYPASS    "1" to skip auth (mode-1 standalone)
-//	INTERCHANGE_PUBLIC_PATHS   "path,path,..." gateway-side paths that skip
-//	                           bearer-token verification (routing + anti-spoof
-//	                           still apply). Entries ending in "/" are prefix
-//	                           matches, e.g.
-//	                             "/herald/.well-known/,/herald/jwks"
+//	INTERCHANGE_ADDR                listen addr (default :8080)
+//	INTERCHANGE_ROUTES              "prefix=backend,prefix=backend,..." e.g.
+//	                                "/herald=http://herald:8099,/ledger=http://ledger:8080"
+//	                                Note: /knowledge is NOT listed here; it is handled via
+//	                                grpc-gateway translation to commonplace (see below).
+//	INTERCHANGE_HERALD_ISSUER       herald issuer URL (required unless bypass) — for JWKS verify
+//	INTERCHANGE_HERALD_JWKS_URL     optional override pointing heraldauth at an
+//	                                internal JWKS endpoint instead of going through
+//	                                discovery on the public issuer. Use this when
+//	                                the gateway is fronting its own issuer to avoid
+//	                                a boot loop calling itself, e.g.
+//	                                  INTERCHANGE_HERALD_JWKS_URL=http://herald.cwb.svc:8099/jwks
+//	INTERCHANGE_AUTH_BYPASS         "1" to skip auth (mode-1 standalone)
+//	INTERCHANGE_PUBLIC_PATHS        "path,path,..." gateway-side paths that skip
+//	                                bearer-token verification (routing + anti-spoof
+//	                                still apply). Entries ending in "/" are prefix
+//	                                matches, e.g.
+//	                                  "/herald/.well-known/,/herald/jwks"
+//	INTERCHANGE_COMMONPLACE_GRPC    commonplace gRPC address for grpc-gateway translation,
+//	                                e.g. "commonplace.cwb.svc:50051"
+//	INTERCHANGE_TLS_CERT            interchange's mTLS client certificate (PEM)
+//	INTERCHANGE_TLS_KEY             interchange's mTLS client key (PEM)
+//	INTERCHANGE_TLS_CA              CA certificate for verifying commonplace's server cert (PEM)
 package main
 
 import (
@@ -34,8 +41,13 @@ import (
 	"os"
 	"strings"
 
+	cwbv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/v1"
 	"github.com/CarriedWorldUniverse/herald/heraldauth"
+	"github.com/CarriedWorldUniverse/interchange/internal/edge"
 	"github.com/CarriedWorldUniverse/interchange/internal/gateway"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func main() {
@@ -45,9 +57,6 @@ func main() {
 	routes, err := parseRoutes(os.Getenv("INTERCHANGE_ROUTES"))
 	if err != nil {
 		log.Fatalf("interchange-gateway: routes: %v", err)
-	}
-	if len(routes) == 0 {
-		log.Fatal("interchange-gateway: INTERCHANGE_ROUTES is empty (nothing to proxy)")
 	}
 
 	var verifier gateway.Verifier
@@ -70,12 +79,73 @@ func main() {
 
 	publicPaths := parsePublicPaths(os.Getenv("INTERCHANGE_PUBLIC_PATHS"))
 
+	// Build grpc-gateway mux for /knowledge → commonplace gRPC translation.
+	// The gwMux WithMetadata annotator reads the verified identity stashed in
+	// the request context by authInject (via identityCtxKey) and emits it as
+	// cwb-* gRPC metadata on the outgoing call to commonplace. This is the
+	// correct mechanism: grpc-gateway calls annotators during request handling
+	// and merges their MD into the outgoing context, so identity set here
+	// safely reaches commonplace's incoming gRPC metadata.
+	gwMux := runtime.NewServeMux(
+		runtime.WithMarshalerOption(runtime.MIMEWildcard, &runtime.HTTPBodyMarshaler{
+			Marshaler: &runtime.JSONPb{
+				MarshalOptions:   protojson.MarshalOptions{UseProtoNames: true, EmitUnpopulated: true},
+				UnmarshalOptions: protojson.UnmarshalOptions{DiscardUnknown: true},
+			},
+		}),
+		runtime.WithMetadata(func(ctx context.Context, _ *http.Request) metadata.MD {
+			id, ok := ctx.Value(identityCtxKey{}).(edge.Identity)
+			if !ok {
+				return nil
+			}
+			md := metadata.MD{}
+			md.Set("cwb-org", id.Org)
+			md.Set("cwb-subject", id.Subject)
+			md.Set("cwb-kind", id.Kind)
+			if len(id.Scopes) > 0 {
+				md.Set("cwb-scopes", strings.Join(id.Scopes, " "))
+			}
+			if len(id.Products) > 0 {
+				md.Set("cwb-products", strings.Join(id.Products, " "))
+			}
+			if id.ResponsibleHuman != "" {
+				md.Set("cwb-responsible-human", id.ResponsibleHuman)
+			}
+			return md
+		}),
+	)
+
+	grpcAddr := os.Getenv("INTERCHANGE_COMMONPLACE_GRPC")
+	if grpcAddr == "" {
+		// Default for k3s deploy; can be overridden.
+		grpcAddr = "commonplace.cwb.svc:50051"
+	}
+	conn, err := edge.DialPillar(
+		grpcAddr,
+		os.Getenv("INTERCHANGE_TLS_CERT"),
+		os.Getenv("INTERCHANGE_TLS_KEY"),
+		os.Getenv("INTERCHANGE_TLS_CA"),
+	)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial commonplace (%s): %v", grpcAddr, err)
+	}
+	if err := cwbv1.RegisterKnowledgeServiceHandler(context.Background(), gwMux, conn); err != nil {
+		log.Fatalf("interchange-gateway: register knowledge handler: %v", err)
+	}
+
+	knowledgeHandler := authInject(gwMux, verifier, "commonplace")
+
+	if len(routes) == 0 && !bypass {
+		log.Printf("interchange-gateway: WARNING no reverse-proxy routes configured (only grpc-gateway /knowledge)")
+	}
+
 	g, err := gateway.New(gateway.Config{
 		Verifier:      verifier,
 		AuthBypass:    bypass,
 		Routes:        routes,
 		PublicPaths:   publicPaths,
 		RouteProducts: routeProducts,
+		GRPCHandlers:  map[string]http.Handler{"/knowledge": knowledgeHandler},
 	})
 	if err != nil {
 		log.Fatalf("interchange-gateway: %v", err)
@@ -85,6 +155,74 @@ func main() {
 	if err := http.ListenAndServe(addr, g.Handler()); err != nil {
 		log.Fatalf("interchange-gateway: %v", err)
 	}
+}
+
+// identityCtxKey is the typed key used to stash the verified edge.Identity in
+// the request context so the grpc-gateway WithMetadata annotator can read it.
+type identityCtxKey struct{}
+
+// authInject returns an http.Handler that:
+//  1. Extracts and verifies the bearer token via v.
+//  2. Checks product entitlement (NEX-427) — 403 if the org doesn't have product.
+//  3. Strips any client-supplied cwb-* headers (anti-spoof for the HTTP layer;
+//     the grpc-gateway WithMetadata annotator handles the gRPC layer).
+//  4. Stashes the verified identity in the request context via identityCtxKey
+//     so the grpc-gateway WithMetadata annotator can emit cwb-* gRPC metadata.
+//  5. Forwards to next (the grpc-gateway mux).
+//
+// The handler owns ALL auth for the /knowledge gRPC-mode route; the outer
+// gateway skips its own bearer-verify for gRPC-mode routes.
+func authInject(next http.Handler, v gateway.Verifier, product string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tok := bearer(r)
+		if tok == "" {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		// In bypass mode v may be nil; if so, skip verify and inject a zero identity.
+		var gid gateway.Identity
+		if v != nil {
+			var err error
+			gid, err = v.Verify(r.Context(), tok)
+			if err != nil {
+				http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		id := edge.Identity{
+			Subject:          gid.Subject,
+			Kind:             gid.Kind,
+			Org:              gid.Org,
+			ResponsibleHuman: gid.ResponsibleHuman,
+			Scopes:           gid.Scopes,
+			Products:         gid.Products,
+		}
+		if !edge.HasProduct(id, product) {
+			http.Error(w, `{"error":"product not enabled for org"}`, http.StatusForbidden)
+			return
+		}
+		// Strip any client-supplied cwb-* HTTP headers (anti-spoof).
+		for _, k := range []string{
+			"cwb-org", "cwb-subject", "cwb-kind",
+			"cwb-scopes", "cwb-products", "cwb-responsible-human",
+		} {
+			r.Header.Del(k)
+			r.Header.Del("Grpc-Metadata-" + k)
+		}
+		// Stash verified identity in context for the WithMetadata annotator.
+		ctx := context.WithValue(r.Context(), identityCtxKey{}, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// bearer extracts the token from "Authorization: Bearer <token>".
+func bearer(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	const p = "Bearer "
+	if len(h) > len(p) && strings.EqualFold(h[:len(p)], p) {
+		return h[len(p):]
+	}
+	return ""
 }
 
 // heraldVerifier adapts *heraldauth.Verifier to gateway.Verifier.
