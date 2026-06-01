@@ -26,9 +26,9 @@ spec:
             - name: INTERCHANGE_ADDR
               value: ":8080"
             - name: INTERCHANGE_ROUTES
-              # /knowledge is NOT in this list — it is handled by the gRPC
-              # edge (INTERCHANGE_COMMONPLACE_GRPC below), not reverse-proxied.
-              value: "/herald=http://herald.cwb.svc:8099,/ledger=http://ledger.cwb.svc:8081,/cairn=http://cairn.cwb.svc:8100"
+              # /knowledge and /ledger are NOT in this list — both are handled
+              # by gRPC edges below, not reverse-proxied.
+              value: "/herald=http://herald.cwb.svc:8099,/cairn=http://cairn.cwb.svc:8100"
             - name: INTERCHANGE_HERALD_ISSUER
               # Must match HERALD_ISSUER exactly — this is what the `iss`
               # claim is checked against.
@@ -47,6 +47,10 @@ spec:
             # against commonplace using the interchange-client-tls mTLS cert.
             - name: INTERCHANGE_COMMONPLACE_GRPC
               value: "commonplace.cwb.svc:8101"
+            # gRPC edge — ledger is no longer reverse-proxied; interchange dials
+            # it directly over mTLS using the interchange-client-tls cert.
+            - name: INTERCHANGE_LEDGER_GRPC
+              value: "ledger.cwb.svc:8081"
             # mTLS client cert for gRPC calls to commonplace.
             # cert-manager populates interchange-client-tls from 05-certs.yaml
             # in the commonplace repo.
