@@ -903,6 +903,47 @@ func TestHeraldComposite_OIDCPassthrough(t *testing.T) {
 	}
 }
 
+// TestHeraldComposite_RevokeTokenless: POST /revoke (RFC 7009 refresh-token
+// revocation — credential is the refresh token in the body, NOT a bearer)
+// reaches herald's HTTP backend with NO gateway auth, exactly like /token. It is
+// one of the OIDC bootstrap routes, the ONLY tokenless paths through interchange.
+// A non-bootstrap admin route still 401s without a bearer (covered by
+// TestHeraldComposite_AdminNoToken401, asserted here too for contrast).
+func TestHeraldComposite_RevokeTokenless(t *testing.T) {
+	rec := &heraldRec{}
+	backend := newHeraldBackend(t, rec)
+	h := buildHeraldHandler(t, &stubHeraldAdminSrv{}, backend.URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	// /revoke with NO Authorization must reach herald (not 401'd by the gateway).
+	resp, err := http.Post(srv.URL+"/revoke", "application/x-www-form-urlencoded",
+		strings.NewReader("token=some-refresh-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/revoke tokenless status = %d, want 200 (must reach herald)", resp.StatusCode)
+	}
+	if rec.path != "/revoke" {
+		t.Errorf("backend last path = %q, want /revoke", rec.path)
+	}
+	if rec.hadAuth {
+		t.Errorf("/revoke passthrough must not carry an Authorization header")
+	}
+
+	// Contrast: a non-bootstrap admin route is still 401'd without a bearer.
+	resp2, err := http.Post(srv.URL+"/api/orgs", "application/json", strings.NewReader(`{"name":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/api/orgs no-token status = %d, want 401", resp2.StatusCode)
+	}
+}
+
 // TestHeraldComposite_AdminToGRPC: /api/orgs reaches the gRPC AdminService with
 // the verified identity as cwb-* metadata.
 func TestHeraldComposite_AdminToGRPC(t *testing.T) {
