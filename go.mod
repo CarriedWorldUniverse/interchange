@@ -3,7 +3,7 @@ module github.com/CarriedWorldUniverse/interchange
 go 1.26.3
 
 require (
-	github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260601231922-69da6cb8a346
+	github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260602012124-c875c9576c65
 	github.com/CarriedWorldUniverse/herald v0.0.0-20260531221851-204bf0e45da6
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0
 	golang.org/x/crypto v0.50.0

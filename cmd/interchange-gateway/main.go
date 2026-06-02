@@ -53,6 +53,7 @@ import (
 	"time"
 
 	cairnv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/cairn/v1"
+	heraldv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/herald/v1"
 	cwbv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/v1"
 	"github.com/CarriedWorldUniverse/herald/heraldauth"
 	"github.com/CarriedWorldUniverse/interchange/internal/edge"
@@ -177,6 +178,39 @@ func main() {
 	}
 	cairnHandler := cairnComposite(cairnMux, httputil.NewSingleHostReverseProxy(cairnGitURL), verifier, "cairn")
 
+	// -----------------------------------------------------------------------
+	// /herald → COMPOSITE edge (Phase 4). herald is dual-faced: OIDC
+	// (discovery/JWKS/token) + the agent-bootstrap stay HTTP and are
+	// herald-self-authed, so they pass through UNauthenticated; only the admin
+	// paths (/api/orgs*, /api/humans/*) route to herald's gRPC AdminService,
+	// JWT-authed with the verified identity injected as cwb-* metadata. herald
+	// is core → no product gate. by-fingerprint is NOT exposed here (gRPC-only,
+	// dialed directly by cairn). The herald HTTP backend is reused from the
+	// existing /herald reverse-proxy route, removed from the plain Routes.
+	// -----------------------------------------------------------------------
+	heraldGRPC := os.Getenv("INTERCHANGE_HERALD_GRPC")
+	if heraldGRPC == "" {
+		heraldGRPC = "herald.cwb.svc:8098"
+	}
+	heraldHTTP := routes["/herald"]
+	if heraldHTTP == "" {
+		heraldHTTP = "http://herald.cwb.svc:8099"
+	}
+	delete(routes, "/herald")
+	heraldConn, err := edge.DialPillar(heraldGRPC, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial herald (%s): %v", heraldGRPC, err)
+	}
+	heraldMux := newGRPCMux()
+	if err := heraldv1.RegisterAdminServiceHandler(context.Background(), heraldMux, heraldConn); err != nil {
+		log.Fatalf("interchange-gateway: register herald admin handler: %v", err)
+	}
+	heraldHTTPURL, err := url.Parse(heraldHTTP)
+	if err != nil {
+		log.Fatalf("interchange-gateway: herald http backend %q: %v", heraldHTTP, err)
+	}
+	heraldHandler := heraldComposite(heraldMux, httputil.NewSingleHostReverseProxy(heraldHTTPURL), verifier)
+
 	if len(routes) == 0 && !bypass {
 		log.Printf("interchange-gateway: WARNING no reverse-proxy routes configured (only grpc-gateway edges)")
 	}
@@ -191,6 +225,7 @@ func main() {
 			"/knowledge": knowledgeHandler,
 			"/ledger":    ledgerHandler,
 			"/cairn":     cairnHandler,
+			"/herald":    heraldHandler,
 		},
 	})
 	if err != nil {
@@ -392,6 +427,53 @@ func cairnComposite(apiMux, gitProxy http.Handler, v gateway.Verifier, product s
 		// git lane → cairn HTTP (identity carried as trusted X-CWB-* headers).
 		injectCWBHeaders(r, id)
 		gitProxy.ServeHTTP(w, r)
+	})
+}
+
+// heraldComposite is the dual-faced /herald edge (Phase 4). herald's OIDC
+// (discovery/JWKS/token) + agent-bootstrap (self-provision/validate) stay HTTP
+// and are herald-self-authed, so they pass through UNauthenticated; only the
+// admin paths (/api/orgs*, /api/humans/*) route to herald's gRPC AdminService,
+// JWT-authed with the verified identity injected as cwb-* metadata. herald is a
+// core product → no product-entitlement gate. by-fingerprint is not reachable
+// here (gRPC-only, dialed directly by cairn over mTLS).
+func heraldComposite(apiMux, httpProxy http.Handler, v gateway.Verifier) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if !strings.HasPrefix(p, "/api/orgs") && !strings.HasPrefix(p, "/api/humans/") {
+			// OIDC + bootstrap + healthz → HTTP passthrough; herald self-auths.
+			// Strip any client-forged identity (defence in depth — herald does
+			// not trust injected identity on this lane).
+			stripSpoofedIdentity(r)
+			httpProxy.ServeHTTP(w, r)
+			return
+		}
+		// Admin gRPC lane: verify the herald JWT, inject cwb-* identity.
+		tok := bearer(r)
+		if tok == "" {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		var gid gateway.Identity
+		if v != nil {
+			var err error
+			gid, err = v.Verify(r.Context(), tok)
+			if err != nil {
+				http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		id := edge.Identity{
+			Subject:          gid.Subject,
+			Kind:             gid.Kind,
+			Org:              gid.Org,
+			ResponsibleHuman: gid.ResponsibleHuman,
+			Scopes:           gid.Scopes,
+			Products:         gid.Products,
+		}
+		stripSpoofedIdentity(r)
+		ctx := context.WithValue(r.Context(), identityCtxKey{}, id)
+		apiMux.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
