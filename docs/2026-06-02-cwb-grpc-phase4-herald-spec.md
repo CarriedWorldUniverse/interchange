@@ -34,7 +34,7 @@ Enforcement rule per RPC: `platform-admin` ⇒ allow any org; else require `hera
 - An identity belongs to exactly one org. **Admin-org accounts can NOT be members of, or act within, any working org**, and **working-org accounts can never hold `herald:platform-admin`**. herald rejects any attempt to add an admin-org principal to a working org (and vice-versa for granting platform-admin).
 - `herald:platform-admin` confers **platform + org-lifecycle authority only** (create / list / delete orgs, products, platform management) — it is **NOT** tenant-data access. A platform admin is never an org *member*, so the pillars' org-scoped data (cairn repos, ledger issues, commonplace knowledge) is **not** reachable by an admin-org identity through membership. Managing an org's *existence* ≠ reading its *contents*. This keeps the platform root from being a backdoor into every tenant's data.
 
-Self-serve "any authenticated user creates an org and becomes its admin" is **deferred** (commercial layer); for the MVP, `CreateOrg` is `platform-admin`-gated. The richer NEX-413 org-ownership features (invites, domain verification, hosted/trusted tiers) are **out of scope** here — Phase 4 lands only the authz *spine*.
+**`CreateOrg` is self-serve at the primitive level** and is the one RPC *outside* the target-org rule (it has no pre-existing org): **any authenticated herald principal may create an org and becomes its `org-admin`**. It is NOT platform-admin-gated — platform-admin is only the admin org + cross-org lifecycle (list-all, delete-any) + platform management. The **public-signup + invite-code onboarding flow** that drives `CreateOrg` (a new account *with* an invite → join the invite's org; *without* one → create a new org) is the **NEX-413 org-ownership feature and is DEFERRED** — Phase 4 exposes the primitives (`CreateOrg`→org-admin, add-member) but not the signup/invite branching. The richer NEX-413 pieces (invites, domain verification, hosted/trusted tiers) are out of scope here — Phase 4 lands only the authz *spine* + primitives.
 
 ## 4. Genesis — the admin (administration) org (deploy-time, no shipped credentials)
 
@@ -98,5 +98,5 @@ Like cairn's `/cairn`, `/herald` becomes a **composite** handler:
 
 1. **Scope names** — `herald:platform-admin` / `herald:org-admin` ok, or fold into existing scope conventions?
 2. **Owner credential type** — password (path-A) seeded from a Secret, casket key, or both? (Leaning: password for the human owner now; casket later.)
-3. **`CreateOrg` gating** — platform-admin-only for the MVP (self-serve deferred) — confirm.
+3. ~~`CreateOrg` gating~~ — **RESOLVED:** self-serve primitive (any authenticated principal → create org → becomes org-admin; NOT platform-admin-gated). The public-signup + invite-code onboarding flow that drives it is deferred to NEX-413.
 4. **Genesis as herald init-mode vs a separate one-shot Job** — implementer's call, or a preference?
