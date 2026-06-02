@@ -83,6 +83,11 @@ spec:
             # /cairn reverse-proxy backend in INTERCHANGE_ROUTES above.
             - name: INTERCHANGE_CAIRN_GRPC
               value: "cairn.cwb.svc:8102"
+            # gRPC edge — herald's admin /api/ lane (Phase 4). The OIDC lane
+            # (.well-known/jwks/token) reverse-proxies to the /herald backend in
+            # INTERCHANGE_ROUTES above (HTTP passthrough).
+            - name: INTERCHANGE_HERALD_GRPC
+              value: "herald.cwb.svc:8098"
             # mTLS client cert for gRPC calls to commonplace.
             # cert-manager populates interchange-client-tls from 05-certs.yaml
             # in the commonplace repo.
