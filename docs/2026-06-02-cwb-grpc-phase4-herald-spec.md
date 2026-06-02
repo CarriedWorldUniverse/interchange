@@ -30,15 +30,23 @@ herald JWTs already carry `sub`, `act.sub` (responsible human), `org`, `scope`, 
 
 Enforcement rule per RPC: `platform-admin` ⇒ allow any org; else require `herald:org-admin` **and** `target_org == cwb-org`. herald is a **core** product, so interchange's product-entitlement gate exempts `/herald` (no `cwb-products` check).
 
+**Domain separation (load-bearing invariant).** The admin org is the *administration* domain; working/tenant orgs are the tenant domain — and the two are **disjoint**:
+- An identity belongs to exactly one org. **Admin-org accounts can NOT be members of, or act within, any working org**, and **working-org accounts can never hold `herald:platform-admin`**. herald rejects any attempt to add an admin-org principal to a working org (and vice-versa for granting platform-admin).
+- `herald:platform-admin` confers **platform + org-lifecycle authority only** (create / list / delete orgs, products, platform management) — it is **NOT** tenant-data access. A platform admin is never an org *member*, so the pillars' org-scoped data (cairn repos, ledger issues, commonplace knowledge) is **not** reachable by an admin-org identity through membership. Managing an org's *existence* ≠ reading its *contents*. This keeps the platform root from being a backdoor into every tenant's data.
+
 Self-serve "any authenticated user creates an org and becomes its admin" is **deferred** (commercial layer); for the MVP, `CreateOrg` is `platform-admin`-gated. The richer NEX-413 org-ownership features (invites, domain verification, hosted/trusted tiers) are **out of scope** here — Phase 4 lands only the authz *spine*.
 
-## 4. Genesis (deploy-time, no shipped credentials)
+## 4. Genesis — the admin (administration) org (deploy-time, no shipped credentials)
 
-A deploy-time provisioning step (a herald init mode or a one-shot Job) creates, **idempotently**:
-1. the **owning organization** (the platform's own org), and
-2. the **owner account** `cwadmin@carriedworld.com` (a human identity) granted **`herald:platform-admin`**,
+The genesis root is a dedicated **administration org** whose purpose is to **support the deploy + platform operations** — it is NOT a general working org. A deploy-time provisioning step (a herald init mode or a one-shot Job) creates, **idempotently**:
+1. the **admin org** (the platform administration org), and
+2. the **platform-admin account** `cwadmin@carriedworld.com` (a human identity in the admin org) granted **`herald:platform-admin`**,
 
-with credentials (password and/or a casket key) supplied from a **k8s Secret / deploy config at apply time** — never from the image or source. If the owning org/owner already exists, the step is a no-op (no credential reset). The owner then authenticates via the normal flows (path-A password grant or casket assertion) to obtain a `herald:platform-admin` token and provisions everything downstream through the gateway.
+with credentials (password and/or a casket key) supplied from a **k8s Secret / deploy config at apply time** — never from the image or source. If the admin org/account already exists, the step is a no-op (no credential reset). The owner then authenticates via the normal flows (path-A password grant or casket assertion) to obtain a `herald:platform-admin` token and administers the platform + provisions working orgs through the gateway.
+
+Per §3, admin-org accounts are **firewalled from working orgs** (platform administration only — never tenant members).
+
+**Platform-management tooling** (operating the deploy, managing orgs/quotas/health from the admin org) **lives in herald** and will be built out **later** — Phase 4 only establishes the admin org + the platform-admin authority it runs on.
 
 **Removed:** `HERALD_ADMIN_TOKEN` and the `adminapi` static-token comparison path. There is no break-glass shared secret and no default/seeded password in code.
 
