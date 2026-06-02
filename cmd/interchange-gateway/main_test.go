@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	cairnv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/cairn/v1"
+	heraldv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/herald/v1"
 	cwbv1 "github.com/CarriedWorldUniverse/cwb-proto/gen/go/cwb/v1"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	"google.golang.org/grpc"
@@ -811,5 +812,162 @@ func TestCairnComposite_SpoofStripped(t *testing.T) {
 	resp2.Body.Close()
 	if got := repoStub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "org-cairn" {
 		t.Errorf("spoof leaked to gRPC: cwb-org = %v, want [org-cairn]", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Herald composite-edge tests (Phase 4): OIDC/bootstrap → HTTP passthrough
+// (unauthenticated); /api/orgs* + /api/humans/* → gRPC AdminService (JWT-authed).
+// ---------------------------------------------------------------------------
+
+type stubHeraldAdminSrv struct {
+	heraldv1.UnimplementedAdminServiceServer
+	lastMD     metadata.MD
+	lastMethod string
+}
+
+func (s *stubHeraldAdminSrv) CreateOrg(ctx context.Context, r *heraldv1.CreateOrgRequest) (*heraldv1.CreateOrgResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "CreateOrg"
+	return &heraldv1.CreateOrgResponse{Org: &heraldv1.Org{Id: "org-1", Name: r.GetName()}}, nil
+}
+
+type heraldRec struct {
+	path    string
+	hadAuth bool
+}
+
+func newHeraldBackend(t *testing.T, rec *heraldRec) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.path = r.URL.Path
+		rec.hadAuth = r.Header.Get("Authorization") != ""
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func buildHeraldHandler(t *testing.T, adminStub heraldv1.AdminServiceServer, httpBackend string, v gateway.Verifier) http.Handler {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	heraldv1.RegisterAdminServiceServer(grpcSrv, adminStub)
+	go grpcSrv.Serve(lis)
+	t.Cleanup(grpcSrv.GracefulStop)
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial stub: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	heraldMux := newGRPCMux()
+	if err := heraldv1.RegisterAdminServiceHandler(context.Background(), heraldMux, conn); err != nil {
+		t.Fatalf("register herald admin handler: %v", err)
+	}
+	u, err := url.Parse(httpBackend)
+	if err != nil {
+		t.Fatalf("backend url: %v", err)
+	}
+	return heraldComposite(heraldMux, httputil.NewSingleHostReverseProxy(u), v)
+}
+
+func validHeraldIdentity() stubVerifier {
+	return stubVerifier{id: gateway.Identity{Subject: "owner", Kind: "human", Org: "cwb-admin", Scopes: []string{"herald:platform-admin"}}}
+}
+
+// TestHeraldComposite_OIDCPassthrough: OIDC paths reach herald's HTTP backend
+// with NO gateway auth (tokenless).
+func TestHeraldComposite_OIDCPassthrough(t *testing.T) {
+	rec := &heraldRec{}
+	backend := newHeraldBackend(t, rec)
+	h := buildHeraldHandler(t, &stubHeraldAdminSrv{}, backend.URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	for _, p := range []string{"/.well-known/openid-configuration", "/jwks", "/token"} {
+		resp, err := http.Get(srv.URL + p) // no Authorization
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s tokenless status = %d, want 200", p, resp.StatusCode)
+		}
+	}
+	if rec.path != "/token" {
+		t.Errorf("backend last path = %q, want /token", rec.path)
+	}
+}
+
+// TestHeraldComposite_AdminToGRPC: /api/orgs reaches the gRPC AdminService with
+// the verified identity as cwb-* metadata.
+func TestHeraldComposite_AdminToGRPC(t *testing.T) {
+	adminStub := &stubHeraldAdminSrv{}
+	backend := newHeraldBackend(t, &heraldRec{})
+	h := buildHeraldHandler(t, adminStub, backend.URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/orgs", strings.NewReader(`{"name":"acme"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("admin status = %d, body=%s", resp.StatusCode, b)
+	}
+	if adminStub.lastMethod != "CreateOrg" {
+		t.Errorf("lastMethod = %q, want CreateOrg", adminStub.lastMethod)
+	}
+	if got := adminStub.lastMD.Get("cwb-subject"); len(got) != 1 || got[0] != "owner" {
+		t.Errorf("cwb-subject = %v, want [owner]", got)
+	}
+}
+
+// TestHeraldComposite_AdminNoToken401: the admin lane requires a bearer token.
+func TestHeraldComposite_AdminNoToken401(t *testing.T) {
+	h := buildHeraldHandler(t, &stubHeraldAdminSrv{}, newHeraldBackend(t, &heraldRec{}).URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/api/orgs", "application/json", strings.NewReader(`{"name":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("admin no-token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestHeraldComposite_SelfProvisionPassthrough: /api/agents (self-provision) is
+// NOT the admin gRPC lane — it passes through to herald's HTTP backend, which
+// self-authenticates the casket assertion (the gateway does not gate it).
+func TestHeraldComposite_SelfProvisionPassthrough(t *testing.T) {
+	rec := &heraldRec{}
+	backend := newHeraldBackend(t, rec)
+	h := buildHeraldHandler(t, &stubHeraldAdminSrv{}, backend.URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/agents", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer casket-assertion") // herald verifies this, not the gateway
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("self-provision status = %d, want 200 (passthrough)", resp.StatusCode)
+	}
+	if rec.path != "/api/agents" || !rec.hadAuth {
+		t.Errorf("backend got path=%q hadAuth=%v, want /api/agents + Authorization forwarded", rec.path, rec.hadAuth)
 	}
 }
