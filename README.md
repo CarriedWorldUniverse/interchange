@@ -7,9 +7,14 @@
 
 Shared E2E-encrypted relay for Nexus Frame-to-Frame communication.
 
-The Interchange is a small Go server that relays signed, end-to-end encrypted envelopes between paired Nexus instances. It cannot read message content; it only routes ciphertext between the two ends of a pair, gates pair establishment behind operator approval, and evicts old envelopes after a retention window.
+This repository ships two separate binaries with distinct concerns:
 
-Wire protocol: [`docs/spec.md`](./docs/spec.md).
+- **`cmd/interchange`** — the E2E-encrypted pair-relay described below.
+- **`cmd/interchange-gateway`** — the auth-aware reverse proxy that fronts the Carried World Builder (CWB) platform services. It is the single public entry point: it verifies bearer tokens locally against herald's JWKS, injects the verified identity as trusted `X-CWB-*` headers, grpc-gateway-translates the commonplace and ledger RPCs, and reverse-proxies to backends over mTLS. See [`docs/2026-05-30-gateway-mvp-spec.md`](./docs/2026-05-30-gateway-mvp-spec.md) and `cmd/interchange-gateway/main.go`.
+
+The pair-relay (`cmd/interchange`) is a small Go server that relays signed, end-to-end encrypted envelopes between paired Nexus instances. It cannot read message content; it only routes ciphertext between the two ends of a pair, gates pair establishment behind operator approval, and evicts old envelopes after a retention window.
+
+Wire protocol (pair-relay): [`docs/spec.md`](./docs/spec.md).
 
 Client library (Go): [`nexus-cw/casket-go`](https://github.com/nexus-cw/casket-go).
 
@@ -33,9 +38,9 @@ See [`docs/spec.md`](./docs/spec.md) for envelope format, signing, content handl
 
 A Nexus implementing the client side knows *how* to call the endpoints. It does not know *what* is behind them — a single binary on a tailnet host, a load-balanced fleet, a self-hosted relay run by a third party. The wire protocol is the contract; deployment is opaque.
 
-## Build and run
+## Build and run (pair-relay)
 
-Requires Go 1.25+.
+Requires Go 1.26+.
 
 ```sh
 go build ./cmd/interchange
@@ -59,7 +64,7 @@ SQLite (pure-Go via `modernc.org/sqlite`, no CGO). Schema is embedded in `intern
 go test ./...
 ```
 
-91 tests across the discovery, storage, mailbox, sweep, crypto, and pairflow packages. Tests use `httptest` against in-process handlers — no network, no external dependencies.
+The suite covers the discovery, storage, mailbox, sweep, crypto, pairflow, gateway, edge, middleware, and landing packages. Tests use `httptest` against in-process handlers — no network, no external dependencies.
 
 ## Status
 
