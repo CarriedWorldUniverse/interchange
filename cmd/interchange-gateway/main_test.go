@@ -833,6 +833,13 @@ func (s *stubHeraldAdminSrv) CreateOrg(ctx context.Context, r *heraldv1.CreateOr
 	return &heraldv1.CreateOrgResponse{Org: &heraldv1.Org{Id: "org-1", Name: r.GetName()}}, nil
 }
 
+func (s *stubHeraldAdminSrv) Me(ctx context.Context, _ *heraldv1.MeRequest) (*heraldv1.MeResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "Me"
+	return &heraldv1.MeResponse{User: &heraldv1.UserInfo{Id: "owner", Kind: "human"}}, nil
+}
+
 type heraldRec struct {
 	path    string
 	hadAuth bool
@@ -970,6 +977,51 @@ func TestHeraldComposite_AdminToGRPC(t *testing.T) {
 	}
 	if got := adminStub.lastMD.Get("cwb-subject"); len(got) != 1 || got[0] != "owner" {
 		t.Errorf("cwb-subject = %v, want [owner]", got)
+	}
+}
+
+// TestHeraldComposite_MeToGRPC: GET /api/me reaches the gRPC AdminService with
+// the verified identity as cwb-* metadata (the self-identity route is on the
+// admin gRPC lane, not HTTP passthrough).
+func TestHeraldComposite_MeToGRPC(t *testing.T) {
+	adminStub := &stubHeraldAdminSrv{}
+	backend := newHeraldBackend(t, &heraldRec{})
+	h := buildHeraldHandler(t, adminStub, backend.URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/me", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/api/me status = %d, body=%s", resp.StatusCode, b)
+	}
+	if adminStub.lastMethod != "Me" {
+		t.Errorf("lastMethod = %q, want Me", adminStub.lastMethod)
+	}
+	if got := adminStub.lastMD.Get("cwb-subject"); len(got) != 1 || got[0] != "owner" {
+		t.Errorf("cwb-subject = %v, want [owner]", got)
+	}
+}
+
+// TestHeraldComposite_MeNoToken401: /api/me is on the admin lane and requires a
+// bearer token (it is NOT a tokenless OIDC bootstrap path).
+func TestHeraldComposite_MeNoToken401(t *testing.T) {
+	h := buildHeraldHandler(t, &stubHeraldAdminSrv{}, newHeraldBackend(t, &heraldRec{}).URL, validHeraldIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/api/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("/api/me no-token status = %d, want 401", resp.StatusCode)
 	}
 }
 
