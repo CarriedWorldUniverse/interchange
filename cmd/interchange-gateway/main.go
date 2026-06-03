@@ -435,14 +435,14 @@ func cairnComposite(apiMux, gitProxy http.Handler, v gateway.Verifier, product s
 // HTTP and are herald-self-authed, so they pass through UNauthenticated — /revoke
 // (RFC 7009) is credentialed by the refresh token in the body, not a bearer, so
 // like /token it must be tokenless; only the admin paths (/api/orgs*,
-// /api/humans/*) route to herald's gRPC AdminService,
+// /api/humans/*, /api/me) route to herald's gRPC AdminService,
 // JWT-authed with the verified identity injected as cwb-* metadata. herald is a
 // core product → no product-entitlement gate. by-fingerprint is not reachable
 // here (gRPC-only, dialed directly by cairn over mTLS).
 func heraldComposite(apiMux, httpProxy http.Handler, v gateway.Verifier) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if !strings.HasPrefix(p, "/api/orgs") && !strings.HasPrefix(p, "/api/humans/") {
+		if !strings.HasPrefix(p, "/api/orgs") && !strings.HasPrefix(p, "/api/humans/") && p != "/api/me" {
 			// OIDC bootstrap (discovery/jwks/token/revoke) + agent-bootstrap +
 			// healthz → HTTP passthrough; herald self-auths. /revoke (RFC 7009)
 			// is tokenless like /token — its credential is the refresh token in
