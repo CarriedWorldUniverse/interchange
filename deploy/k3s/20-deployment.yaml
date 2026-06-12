@@ -98,6 +98,11 @@ spec:
             # mason itself (NEX-621 leg 1).
             - name: INTERCHANGE_MASON_GRPC
               value: "mason.cwb.svc.cluster.local:8086"
+            # gRPC edge — atlas (StrataService: read-only cloud state behind
+            # the Strata live map, B12). Platform infra: no product gate;
+            # read-scope enforcement lives in atlas itself.
+            - name: INTERCHANGE_ATLAS_GRPC
+              value: "atlas.cwb.svc.cluster.local:8089"
             # mTLS client cert for gRPC calls to commonplace.
             # cert-manager populates interchange-client-tls from 05-certs.yaml
             # in the commonplace repo.
