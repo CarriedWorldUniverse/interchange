@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: ghcr.io/carriedworlduniverse/interchange-gateway:sha-f9552a4@sha256:ed032b2f2630d154a8d78246d638d0dc6597f444c6482e17b2ff031e0831e63c
+          image: ghcr.io/carriedworlduniverse/interchange-gateway:sha-272e387@sha256:f68a77e4f224ec79c7bc40d4b677082c023b7e910d45de70c890ee5a7ff337f1
           imagePullPolicy: IfNotPresent
           # Bounded so a traffic burst (e.g. CI git fan-out proxied through
           # here) can't starve node neighbours (NEX-428). interchange is a
