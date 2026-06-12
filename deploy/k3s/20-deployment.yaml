@@ -29,8 +29,8 @@ spec:
     spec:
       containers:
         - name: gateway
-          image: localhost/interchange-gateway:dev
-          imagePullPolicy: Never
+          image: ghcr.io/carriedworlduniverse/interchange-gateway:main
+          imagePullPolicy: Always
           # Bounded so a traffic burst (e.g. CI git fan-out proxied through
           # here) can't starve node neighbours (NEX-428). interchange is a
           # streaming proxy + local JWT verify — light CPU, low memory (it
