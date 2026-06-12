@@ -7,6 +7,9 @@ metadata:
     app: interchange-gateway
 spec:
   type: LoadBalancer
+  # Pinned so atlas/croft can hostAlias dmonextreme.tail41686e.ts.net → this
+  # IP without the alias silently breaking on a Service recreation.
+  clusterIP: 10.43.239.151
   selector:
     app: interchange-gateway
   ports:
