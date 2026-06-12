@@ -35,6 +35,8 @@
 //	                                e.g. "almanac.cwb.svc:8083"
 //	INTERCHANGE_MASON_GRPC          mason gRPC address for grpc-gateway translation,
 //	                                e.g. "mason.cwb.svc:8086"
+//	INTERCHANGE_ATLAS_GRPC          atlas gRPC address for grpc-gateway translation,
+//	                                e.g. "atlas.cwb.svc.cluster.local:8089"
 //	INTERCHANGE_TLS_CERT            interchange's mTLS client certificate (PEM)
 //	INTERCHANGE_TLS_KEY             interchange's mTLS client key (PEM)
 //	INTERCHANGE_TLS_CA              CA certificate for verifying pillar server certs (PEM)
@@ -191,6 +193,25 @@ func main() {
 	masonHandler := authInject(masonMux, verifier, "")
 
 	// -----------------------------------------------------------------------
+	// /atlas → atlas gRPC edge (StrataService: read-only cloud state behind
+	// the Strata live map; cw/MCP/the web page consume it). Platform infra
+	// (like mason) → no product gate; read-scope enforcement lives in atlas.
+	// -----------------------------------------------------------------------
+	atlasMux := newGRPCMux()
+	atlasAddr := os.Getenv("INTERCHANGE_ATLAS_GRPC")
+	if atlasAddr == "" {
+		atlasAddr = "atlas.cwb.svc.cluster.local:8089"
+	}
+	atlasConn, err := edge.DialPillar(atlasAddr, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial atlas (%s): %v", atlasAddr, err)
+	}
+	if err := cwbv1.RegisterStrataServiceHandler(context.Background(), atlasMux, atlasConn); err != nil {
+		log.Fatalf("interchange-gateway: register strata handler: %v", err)
+	}
+	atlasHandler := authInject(atlasMux, verifier, "")
+
+	// -----------------------------------------------------------------------
 	// /cairn → COMPOSITE edge. cairn is dual-transport: its JSON API is gRPC,
 	// but git Smart-HTTP stays plain HTTP (git can't be gRPC). One handler
 	// auths once, then path-splits: /api/... → grpc-gateway (mTLS to cairn's
@@ -278,6 +299,7 @@ func main() {
 			"/herald":    heraldHandler,
 			"/almanac":   almanacHandler,
 			"/mason":     masonHandler,
+			"/atlas":     atlasHandler,
 		},
 	})
 	if err != nil {

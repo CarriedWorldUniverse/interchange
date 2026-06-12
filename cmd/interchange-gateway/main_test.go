@@ -1398,3 +1398,141 @@ func TestMasonHandler_RejectsSpoofedIdentity(t *testing.T) {
 		t.Errorf("cwb-org = %v, want exactly [org-mason-test]", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Atlas edge tests — /atlas → StrataService (read-only cloud state, B12).
+// atlas is platform infra (no product gate); read-scope enforced inside atlas.
+// ---------------------------------------------------------------------------
+
+// stubStrataSrv is a minimal StrataServiceServer capturing metadata + last method.
+type stubStrataSrv struct {
+	cwbv1.UnimplementedStrataServiceServer
+	lastMD     metadata.MD
+	lastMethod string
+}
+
+func (s *stubStrataSrv) GetCloudState(ctx context.Context, _ *cwbv1.GetCloudStateRequest) (*cwbv1.GetCloudStateResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "GetCloudState"
+	return &cwbv1.GetCloudStateResponse{
+		Nodes: []*cwbv1.Node{{Id: "herald", Kind: cwbv1.NodeKind_NODE_KIND_PILLAR, Status: cwbv1.NodeStatus_NODE_STATUS_UP}},
+	}, nil
+}
+
+func buildAtlasHandler(t *testing.T, stub *stubStrataSrv, v gateway.Verifier) http.Handler {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	cwbv1.RegisterStrataServiceServer(grpcSrv, stub)
+	go grpcSrv.Serve(lis)
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial stub: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	atlasMux := newGRPCMux()
+	if err := cwbv1.RegisterStrataServiceHandler(context.Background(), atlasMux, conn); err != nil {
+		t.Fatalf("register strata handler: %v", err)
+	}
+	return authInject(atlasMux, v, "")
+}
+
+func validAtlasIdentity() stubVerifier {
+	return stubVerifier{id: gateway.Identity{
+		Subject: "agent-atlas-test",
+		Kind:    "agent",
+		Org:     "org-atlas-test",
+		Scopes:  []string{"strata:read"},
+		// Products empty on purpose: core pillars must not be product-gated.
+	}}
+}
+
+// TestAtlasHandler_GetCloudStateProxiesWithMetadata proves GET /api/strata/state
+// reaches the stub StrataService with verified cwb-* metadata and no product gate.
+func TestAtlasHandler_GetCloudStateProxiesWithMetadata(t *testing.T) {
+	stub := &stubStrataSrv{}
+	h := buildAtlasHandler(t, stub, validAtlasIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/strata/state", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/strata/state status = %d, body = %s", resp.StatusCode, b)
+	}
+	if stub.lastMethod != "GetCloudState" {
+		t.Errorf("stub.lastMethod = %q, want \"GetCloudState\"", stub.lastMethod)
+	}
+	if got := stub.lastMD.Get("cwb-subject"); len(got) != 1 || got[0] != "agent-atlas-test" {
+		t.Errorf("cwb-subject = %v, want [agent-atlas-test]", got)
+	}
+	var body struct {
+		Nodes []struct {
+			Id string `json:"id"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(b, &body); err != nil || len(body.Nodes) != 1 || body.Nodes[0].Id != "herald" {
+		t.Errorf("body = %s, want nodes=[{id:herald}] (err=%v)", b, err)
+	}
+}
+
+// TestAtlasHandler_NoToken401 verifies missing bearer token → 401.
+func TestAtlasHandler_NoToken401(t *testing.T) {
+	h := buildAtlasHandler(t, &stubStrataSrv{}, validAtlasIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/strata/state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestAtlasHandler_RejectsSpoofedIdentity: forged cwb-* identity must be
+// stripped on the atlas edge; the stub sees only the verified values.
+func TestAtlasHandler_RejectsSpoofedIdentity(t *testing.T) {
+	stub := &stubStrataSrv{}
+	h := buildAtlasHandler(t, stub, validAtlasIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/strata/state", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Grpc-Metadata-cwb-scopes", "strata:read app:write config:write")
+	req.Header.Set("cwb-scopes", "admin:write")
+	req.Header.Set("Grpc-Metadata-Cwb-Org", "evil-org")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	if got := stub.lastMD.Get("cwb-scopes"); len(got) != 1 || got[0] != "strata:read" {
+		t.Errorf("cwb-scopes = %v, want exactly [strata:read] (spoofed escalation must be stripped)", got)
+	}
+	if got := stub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "org-atlas-test" {
+		t.Errorf("cwb-org = %v, want exactly [org-atlas-test]", got)
+	}
+}
