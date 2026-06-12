@@ -88,6 +88,16 @@ spec:
             # INTERCHANGE_ROUTES above (HTTP passthrough).
             - name: INTERCHANGE_HERALD_GRPC
               value: "herald.cwb.svc:8098"
+            # gRPC edge — almanac (Config/Secret/AlmanacAdmin services). Core
+            # pillar: no product gate; config:*/secret:* scopes enforced in
+            # almanac itself (NEX-621 leg 1).
+            - name: INTERCHANGE_ALMANAC_GRPC
+              value: "almanac.cwb.svc.cluster.local:8083"
+            # gRPC edge — mason (AppService: read/trigger of almanac-declared
+            # apps). Core pillar: no product gate; app:* scopes enforced in
+            # mason itself (NEX-621 leg 1).
+            - name: INTERCHANGE_MASON_GRPC
+              value: "mason.cwb.svc.cluster.local:8086"
             # mTLS client cert for gRPC calls to commonplace.
             # cert-manager populates interchange-client-tls from 05-certs.yaml
             # in the commonplace repo.

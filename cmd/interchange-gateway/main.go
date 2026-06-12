@@ -31,6 +31,10 @@
 //	                                e.g. "commonplace.cwb.svc:50051"
 //	INTERCHANGE_LEDGER_GRPC         ledger gRPC address for grpc-gateway translation,
 //	                                e.g. "ledger.cwb.svc:50051"
+//	INTERCHANGE_ALMANAC_GRPC        almanac gRPC address for grpc-gateway translation,
+//	                                e.g. "almanac.cwb.svc:8083"
+//	INTERCHANGE_MASON_GRPC          mason gRPC address for grpc-gateway translation,
+//	                                e.g. "mason.cwb.svc:8086"
 //	INTERCHANGE_TLS_CERT            interchange's mTLS client certificate (PEM)
 //	INTERCHANGE_TLS_KEY             interchange's mTLS client key (PEM)
 //	INTERCHANGE_TLS_CA              CA certificate for verifying pillar server certs (PEM)
@@ -141,6 +145,52 @@ func main() {
 	ledgerHandler := authInject(ledgerMux, verifier, "ledger")
 
 	// -----------------------------------------------------------------------
+	// /almanac → almanac gRPC edge (Config/Secret/AlmanacAdmin services).
+	// almanac is platform-core configuration (like herald) → no product gate
+	// (product "" = core); scope enforcement (config:* / secret:* /
+	// almanac:purge) lives in almanac itself, driven by the cwb-scopes
+	// metadata this edge injects.
+	// -----------------------------------------------------------------------
+	almanacMux := newGRPCMux()
+	almanacAddr := os.Getenv("INTERCHANGE_ALMANAC_GRPC")
+	if almanacAddr == "" {
+		almanacAddr = "almanac.cwb.svc:8083"
+	}
+	almanacConn, err := edge.DialPillar(almanacAddr, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial almanac (%s): %v", almanacAddr, err)
+	}
+	for _, reg := range []func(context.Context, *runtime.ServeMux, *grpc.ClientConn) error{
+		cwbv1.RegisterConfigServiceHandler,
+		cwbv1.RegisterSecretServiceHandler,
+		cwbv1.RegisterAlmanacAdminServiceHandler,
+	} {
+		if err := reg(context.Background(), almanacMux, almanacConn); err != nil {
+			log.Fatalf("interchange-gateway: register almanac handler: %v", err)
+		}
+	}
+	almanacHandler := authInject(almanacMux, verifier, "")
+
+	// -----------------------------------------------------------------------
+	// /mason → mason gRPC edge (AppService: read/trigger of almanac-declared
+	// apps). Platform infra (like almanac) → no product gate; app:read /
+	// app:write scope enforcement lives in mason.
+	// -----------------------------------------------------------------------
+	masonMux := newGRPCMux()
+	masonAddr := os.Getenv("INTERCHANGE_MASON_GRPC")
+	if masonAddr == "" {
+		masonAddr = "mason.cwb.svc:8086"
+	}
+	masonConn, err := edge.DialPillar(masonAddr, tlsCert, tlsKey, tlsCA)
+	if err != nil {
+		log.Fatalf("interchange-gateway: dial mason (%s): %v", masonAddr, err)
+	}
+	if err := cwbv1.RegisterAppServiceHandler(context.Background(), masonMux, masonConn); err != nil {
+		log.Fatalf("interchange-gateway: register mason handler: %v", err)
+	}
+	masonHandler := authInject(masonMux, verifier, "")
+
+	// -----------------------------------------------------------------------
 	// /cairn → COMPOSITE edge. cairn is dual-transport: its JSON API is gRPC,
 	// but git Smart-HTTP stays plain HTTP (git can't be gRPC). One handler
 	// auths once, then path-splits: /api/... → grpc-gateway (mTLS to cairn's
@@ -226,6 +276,8 @@ func main() {
 			"/ledger":    ledgerHandler,
 			"/cairn":     cairnHandler,
 			"/herald":    heraldHandler,
+			"/almanac":   almanacHandler,
+			"/mason":     masonHandler,
 		},
 	})
 	if err != nil {
@@ -324,7 +376,9 @@ func newGRPCMux() *runtime.ServeMux {
 
 // authInject returns an http.Handler that:
 //  1. Extracts and verifies the bearer token via v.
-//  2. Checks product entitlement (NEX-427) — 403 if the org doesn't have product.
+//  2. Checks product entitlement (NEX-427) — 403 if the org doesn't have
+//     product. product "" means a core/infra pillar (almanac, mason): no
+//     entitlement gate, matching herald's core posture.
 //  3. Strips any client-supplied cwb-* headers (anti-spoof for the HTTP layer;
 //     the grpc-gateway WithMetadata annotator handles the gRPC layer).
 //  4. Stashes the verified identity in the request context via identityCtxKey
@@ -358,7 +412,7 @@ func authInject(next http.Handler, v gateway.Verifier, product string) http.Hand
 			Scopes:           gid.Scopes,
 			Products:         gid.Products,
 		}
-		if !edge.HasProduct(id, product) {
+		if product != "" && !edge.HasProduct(id, product) {
 			http.Error(w, `{"error":"product not enabled for org"}`, http.StatusForbidden)
 			return
 		}
@@ -537,8 +591,9 @@ func (h heraldVerifier) Verify(ctx context.Context, token string) (gateway.Ident
 	}, nil
 }
 
-// routeProducts gates each pillar prefix by its CWB product. herald is core
-// (absent → never gated). Stable platform topology, not per-deploy config.
+// routeProducts gates each pillar prefix by its CWB product. herald, almanac
+// and mason are core/infra (absent → never gated). Stable platform topology,
+// not per-deploy config.
 var routeProducts = map[string]string{
 	"/cairn":     "cairn",
 	"/ledger":    "ledger",

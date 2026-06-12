@@ -1064,3 +1064,337 @@ func TestHeraldComposite_SelfProvisionPassthrough(t *testing.T) {
 		t.Errorf("backend got path=%q hadAuth=%v, want /api/agents + Authorization forwarded", rec.path, rec.hadAuth)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Almanac edge tests (NEX-621 leg 1) — /almanac → Config/Secret/AlmanacAdmin.
+// almanac is core (no product gate); scopes are enforced inside almanac.
+// ---------------------------------------------------------------------------
+
+// stubConfigSrv is a minimal ConfigServiceServer that captures incoming gRPC
+// metadata, mirroring stubKnowledgeSrv.
+type stubConfigSrv struct {
+	cwbv1.UnimplementedConfigServiceServer
+	lastMD     metadata.MD
+	lastMethod string
+}
+
+func (s *stubConfigSrv) GetConfig(ctx context.Context, req *cwbv1.GetConfigRequest) (*cwbv1.GetConfigResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "GetConfig"
+	return &cwbv1.GetConfigResponse{Item: &cwbv1.ConfigItem{Path: req.GetPath()}}, nil
+}
+
+func (s *stubConfigSrv) ListConfig(ctx context.Context, _ *cwbv1.ListConfigRequest) (*cwbv1.ListConfigResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "ListConfig"
+	return &cwbv1.ListConfigResponse{}, nil
+}
+
+// buildAlmanacHandler constructs the almanac handler stack identical to the
+// production wiring (Config + Secret + AlmanacAdmin handlers on one mux,
+// authInject with product "" = core) against an in-process gRPC server.
+func buildAlmanacHandler(t *testing.T, stub *stubConfigSrv, v gateway.Verifier) http.Handler {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	cwbv1.RegisterConfigServiceServer(grpcSrv, stub)
+	cwbv1.RegisterSecretServiceServer(grpcSrv, &cwbv1.UnimplementedSecretServiceServer{})
+	cwbv1.RegisterAlmanacAdminServiceServer(grpcSrv, &cwbv1.UnimplementedAlmanacAdminServiceServer{})
+	go grpcSrv.Serve(lis)
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial stub: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	almanacMux := newGRPCMux()
+	for _, reg := range []func(context.Context, *runtime.ServeMux, *grpc.ClientConn) error{
+		cwbv1.RegisterConfigServiceHandler,
+		cwbv1.RegisterSecretServiceHandler,
+		cwbv1.RegisterAlmanacAdminServiceHandler,
+	} {
+		if err := reg(context.Background(), almanacMux, conn); err != nil {
+			t.Fatalf("register almanac handler: %v", err)
+		}
+	}
+	return authInject(almanacMux, v, "")
+}
+
+// TestAlmanacHandler_GetConfigProxiesWithMetadata proves the /almanac edge:
+// a valid token reaches the stub ConfigService over the multi-segment
+// {path=**} route, carrying the verified cwb-* metadata — and with NO product
+// entitlement required (almanac is core, products list deliberately empty).
+func TestAlmanacHandler_GetConfigProxiesWithMetadata(t *testing.T) {
+	stub := &stubConfigSrv{}
+	v := stubVerifier{id: gateway.Identity{
+		Subject: "agent-almanac-test",
+		Kind:    "agent",
+		Org:     "org-almanac-test",
+		Scopes:  []string{"config:read"},
+		// Products empty on purpose: core pillars must not be product-gated.
+	}}
+	h := buildAlmanacHandler(t, stub, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/config/smoke/test_key", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/config/smoke/test_key status = %d, body = %s", resp.StatusCode, b)
+	}
+	if stub.lastMethod != "GetConfig" {
+		t.Errorf("stub.lastMethod = %q, want \"GetConfig\"", stub.lastMethod)
+	}
+	if got := stub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "org-almanac-test" {
+		t.Errorf("cwb-org = %v, want [org-almanac-test]", got)
+	}
+	if got := stub.lastMD.Get("cwb-scopes"); len(got) != 1 || got[0] != "config:read" {
+		t.Errorf("cwb-scopes = %v, want [config:read]", got)
+	}
+}
+
+// TestAlmanacHandler_NoToken401 verifies missing bearer token → 401.
+func TestAlmanacHandler_NoToken401(t *testing.T) {
+	h := buildAlmanacHandler(t, &stubConfigSrv{}, stubVerifier{})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestAlmanacHandler_RejectsSpoofedIdentity: client-forged cwb-* identity
+// (raw header, Grpc-Metadata- prefixed, both cases) must be stripped; the
+// stub must see exactly the verified values — including cwb-scopes, the
+// privilege-escalation vector (almanac authorizes on it).
+func TestAlmanacHandler_RejectsSpoofedIdentity(t *testing.T) {
+	stub := &stubConfigSrv{}
+	v := stubVerifier{id: gateway.Identity{
+		Subject: "real-subject",
+		Kind:    "agent",
+		Org:     "real-org",
+		Scopes:  []string{"config:read"},
+	}}
+	h := buildAlmanacHandler(t, stub, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/config/smoke/test_key", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Grpc-Metadata-cwb-org", "evil-org")
+	req.Header.Set("Grpc-Metadata-Cwb-Scopes", "config:read config:write secret:read admin:write")
+	req.Header.Set("cwb-scopes", "admin:write")
+	req.Header.Set("cwb-org", "evil-org")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	if got := stub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "real-org" {
+		t.Errorf("cwb-org = %v, want exactly [real-org] (spoof must be stripped)", got)
+	}
+	if got := stub.lastMD.Get("cwb-scopes"); len(got) != 1 || got[0] != "config:read" {
+		t.Errorf("cwb-scopes = %v, want exactly [config:read] (spoofed scope escalation must be stripped)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mason edge tests (NEX-621 leg 1) — /mason → AppService.
+// mason is core (no product gate); app:read/app:write enforced inside mason.
+// ---------------------------------------------------------------------------
+
+// stubAppSrv is a minimal AppServiceServer capturing metadata + last method.
+type stubAppSrv struct {
+	cwbv1.UnimplementedAppServiceServer
+	lastMD     metadata.MD
+	lastMethod string
+}
+
+func (s *stubAppSrv) ListApps(ctx context.Context, _ *cwbv1.ListAppsRequest) (*cwbv1.ListAppsResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "ListApps"
+	return &cwbv1.ListAppsResponse{Apps: []*cwbv1.AppStatus{{Name: "demo"}}}, nil
+}
+
+func (s *stubAppSrv) GetApp(ctx context.Context, req *cwbv1.GetAppRequest) (*cwbv1.GetAppResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "GetApp"
+	return &cwbv1.GetAppResponse{App: &cwbv1.AppStatus{Name: req.GetName()}}, nil
+}
+
+func (s *stubAppSrv) TriggerSync(ctx context.Context, _ *cwbv1.TriggerSyncRequest) (*cwbv1.TriggerSyncResponse, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.lastMD = md
+	s.lastMethod = "TriggerSync"
+	return &cwbv1.TriggerSyncResponse{}, nil
+}
+
+func buildMasonHandler(t *testing.T, stub *stubAppSrv, v gateway.Verifier) http.Handler {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	grpcSrv := grpc.NewServer()
+	cwbv1.RegisterAppServiceServer(grpcSrv, stub)
+	go grpcSrv.Serve(lis)
+	t.Cleanup(grpcSrv.GracefulStop)
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial stub: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	masonMux := newGRPCMux()
+	if err := cwbv1.RegisterAppServiceHandler(context.Background(), masonMux, conn); err != nil {
+		t.Fatalf("register mason handler: %v", err)
+	}
+	return authInject(masonMux, v, "")
+}
+
+func validMasonIdentity() stubVerifier {
+	return stubVerifier{id: gateway.Identity{
+		Subject: "agent-mason-test",
+		Kind:    "agent",
+		Org:     "org-mason-test",
+		Scopes:  []string{"app:read"},
+		// Products empty on purpose: core pillars must not be product-gated.
+	}}
+}
+
+// TestMasonHandler_ListAppsProxiesWithMetadata proves GET /api/apps reaches
+// the stub AppService with verified cwb-* metadata and no product gate.
+func TestMasonHandler_ListAppsProxiesWithMetadata(t *testing.T) {
+	stub := &stubAppSrv{}
+	h := buildMasonHandler(t, stub, validMasonIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/apps", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/apps status = %d, body = %s", resp.StatusCode, b)
+	}
+	if stub.lastMethod != "ListApps" {
+		t.Errorf("stub.lastMethod = %q, want \"ListApps\"", stub.lastMethod)
+	}
+	if got := stub.lastMD.Get("cwb-subject"); len(got) != 1 || got[0] != "agent-mason-test" {
+		t.Errorf("cwb-subject = %v, want [agent-mason-test]", got)
+	}
+	var body struct {
+		Apps []struct {
+			Name string `json:"name"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(b, &body); err != nil || len(body.Apps) != 1 || body.Apps[0].Name != "demo" {
+		t.Errorf("body = %s, want apps=[{name:demo}] (err=%v)", b, err)
+	}
+}
+
+// TestMasonHandler_TriggerSyncNotShadowedByGet: POST /api/apps:sync must
+// dispatch to TriggerSync, not GetApp(name="apps:sync") — the custom-verb
+// sibling of the literal-vs-wildcard collision that bit /knowledge.
+func TestMasonHandler_TriggerSyncNotShadowedByGet(t *testing.T) {
+	stub := &stubAppSrv{}
+	h := buildMasonHandler(t, stub, validMasonIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/apps:sync", strings.NewReader(`{"name":"demo"}`))
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/apps:sync status = %d, body = %s", resp.StatusCode, b)
+	}
+	if stub.lastMethod != "TriggerSync" {
+		t.Errorf("stub.lastMethod = %q, want \"TriggerSync\"", stub.lastMethod)
+	}
+}
+
+// TestMasonHandler_NoToken401 verifies missing bearer token → 401.
+func TestMasonHandler_NoToken401(t *testing.T) {
+	h := buildMasonHandler(t, &stubAppSrv{}, validMasonIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/api/apps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no-token status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestMasonHandler_RejectsSpoofedIdentity: forged cwb-scopes (the
+// app:read→app:write escalation vector) must be stripped on the mason edge.
+func TestMasonHandler_RejectsSpoofedIdentity(t *testing.T) {
+	stub := &stubAppSrv{}
+	h := buildMasonHandler(t, stub, validMasonIdentity())
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("GET", srv.URL+"/api/apps", nil)
+	req.Header.Set("Authorization", "Bearer valid-token")
+	req.Header.Set("Grpc-Metadata-cwb-scopes", "app:read app:write config:write")
+	req.Header.Set("cwb-scopes", "app:read app:write")
+	req.Header.Set("Grpc-Metadata-Cwb-Org", "evil-org")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, b)
+	}
+	if got := stub.lastMD.Get("cwb-scopes"); len(got) != 1 || got[0] != "app:read" {
+		t.Errorf("cwb-scopes = %v, want exactly [app:read] (spoofed escalation must be stripped)", got)
+	}
+	if got := stub.lastMD.Get("cwb-org"); len(got) != 1 || got[0] != "org-mason-test" {
+		t.Errorf("cwb-org = %v, want exactly [org-mason-test]", got)
+	}
+}

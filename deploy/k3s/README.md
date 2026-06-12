@@ -32,7 +32,10 @@ kubectl -n cwb get svc interchange-gateway
 
 `/knowledge` requests are **not** in `INTERCHANGE_ROUTES` — they are translated
 to gRPC calls against `commonplace.cwb.svc:8101` via
-`INTERCHANGE_COMMONPLACE_GRPC`. Interchange uses the `interchange-client-tls`
+`INTERCHANGE_COMMONPLACE_GRPC`. The same grpc-gateway pattern serves `/ledger`
+(`INTERCHANGE_LEDGER_GRPC`), `/almanac` (`INTERCHANGE_ALMANAC_GRPC` —
+Config/Secret/AlmanacAdmin services) and `/mason` (`INTERCHANGE_MASON_GRPC` —
+AppService). Interchange uses the `interchange-client-tls`
 cert (mounted at `/etc/cwb/tls`) for mTLS. Interchange's own listener stays
 plain HTTP on `:8080`.
 
