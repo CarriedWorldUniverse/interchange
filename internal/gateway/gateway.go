@@ -30,6 +30,7 @@ type Identity struct {
 	ResponsibleHuman string
 	Scopes           []string
 	Products         []string
+	Audience         []string // ID-JAG audiences (empty for general tokens)
 }
 
 // Verifier verifies a bearer token and returns the caller identity. The
