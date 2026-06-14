@@ -591,6 +591,84 @@ func TestLedgerHandler_MissingProduct403(t *testing.T) {
 	}
 }
 
+// TestAudienceOK is the unit test for per-route ID-JAG audience scoping.
+func TestAudienceOK(t *testing.T) {
+	cases := []struct {
+		name    string
+		aud     []string
+		product string
+		want    bool
+	}{
+		{"general token (no aud) passes any route", nil, "ledger", true},
+		{"ungated route never checks aud", []string{"cairn"}, "", true},
+		{"matching aud passes", []string{"ledger"}, "ledger", true},
+		{"multi-aud incl match passes", []string{"cairn", "ledger"}, "ledger", true},
+		{"wrong aud rejected", []string{"cairn"}, "ledger", false},
+	}
+	for _, c := range cases {
+		got := audienceOK(gateway.Identity{Audience: c.aud}, c.product)
+		if got != c.want {
+			t.Errorf("%s: audienceOK(%v, %q) = %v, want %v", c.name, c.aud, c.product, got, c.want)
+		}
+	}
+}
+
+// TestLedgerHandler_WrongAudience403 verifies an ID-JAG scoped to a different
+// service (aud=cairn) is rejected on the /ledger route even though the org has
+// the ledger product — per-route audience scoping.
+func TestLedgerHandler_WrongAudience403(t *testing.T) {
+	stub := &stubIssueServiceSrv{}
+	v := stubVerifier{id: gateway.Identity{
+		Subject:  "agent-x",
+		Org:      "org-y",
+		Products: []string{"ledger"},
+		Audience: []string{"cairn"}, // ID-JAG minted for cairn, not ledger
+	}}
+	h := buildLedgerHandler(t, stub, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/issues/search", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer cairn-scoped-idjag")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("wrong-audience status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// TestLedgerHandler_MatchingAudienceOK verifies an ID-JAG scoped to ledger is
+// accepted on the /ledger route.
+func TestLedgerHandler_MatchingAudienceOK(t *testing.T) {
+	stub := &stubIssueServiceSrv{}
+	v := stubVerifier{id: gateway.Identity{
+		Subject:  "agent-x",
+		Org:      "org-y",
+		Products: []string{"ledger"},
+		Audience: []string{"ledger"},
+	}}
+	h := buildLedgerHandler(t, stub, v)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, _ := http.NewRequest("POST", srv.URL+"/api/issues/search", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer ledger-scoped-idjag")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("matching-audience status = %d, want 200, body=%s", resp.StatusCode, b)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Cairn composite-edge tests (Phase 3, step 3): one handler, two lanes —
 // /api/... → cairn gRPC; .git → reverse-proxy to cairn HTTP.

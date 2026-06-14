@@ -409,6 +409,22 @@ func newGRPCMux() *runtime.ServeMux {
 //
 // The handler owns ALL auth for the /knowledge gRPC-mode route; the outer
 // gateway skips its own bearer-verify for gRPC-mode routes.
+// audienceOK enforces per-route ID-JAG audience scoping: a token that carries
+// an audience (an ID-JAG) may only be used on the route whose service it names.
+// General access tokens carry no audience and pass any route (backward
+// compatible); ungated routes (product == "") never audience-check.
+func audienceOK(gid gateway.Identity, product string) bool {
+	if product == "" || len(gid.Audience) == 0 {
+		return true
+	}
+	for _, a := range gid.Audience {
+		if a == product {
+			return true
+		}
+	}
+	return false
+}
+
 func authInject(next http.Handler, v gateway.Verifier, product string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := bearer(r)
@@ -436,6 +452,10 @@ func authInject(next http.Handler, v gateway.Verifier, product string) http.Hand
 		}
 		if product != "" && !edge.HasProduct(id, product) {
 			http.Error(w, `{"error":"product not enabled for org"}`, http.StatusForbidden)
+			return
+		}
+		if !audienceOK(gid, product) {
+			http.Error(w, `{"error":"token audience does not include this service"}`, http.StatusForbidden)
 			return
 		}
 		// Strip any client-supplied cwb-* HTTP headers (anti-spoof).
@@ -490,6 +510,10 @@ func cairnComposite(apiMux, gitProxy http.Handler, v gateway.Verifier, product s
 		}
 		if !edge.HasProduct(id, product) {
 			http.Error(w, `{"error":"product not enabled for org"}`, http.StatusForbidden)
+			return
+		}
+		if !audienceOK(gid, product) {
+			http.Error(w, `{"error":"token audience does not include this service"}`, http.StatusForbidden)
 			return
 		}
 		stripSpoofedIdentity(r)
@@ -610,6 +634,7 @@ func (h heraldVerifier) Verify(ctx context.Context, token string) (gateway.Ident
 		ResponsibleHuman: id.ResponsibleHuman,
 		Scopes:           id.Scopes,
 		Products:         id.Products,
+		Audience:         id.Audience,
 	}, nil
 }
 

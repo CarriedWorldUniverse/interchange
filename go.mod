@@ -4,12 +4,12 @@ go 1.26.3
 
 require (
 	github.com/CarriedWorldUniverse/cwb-proto v0.0.0-20260612184909-72d9a7901296
-	github.com/CarriedWorldUniverse/herald v0.0.0-20260531221851-204bf0e45da6
+	github.com/CarriedWorldUniverse/herald v0.0.0-20260614025118-a7d35ca9f860
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0
 	golang.org/x/crypto v0.50.0
 	golang.org/x/time v0.15.0
 	google.golang.org/grpc v1.81.1
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	modernc.org/sqlite v1.51.0
 )
 
