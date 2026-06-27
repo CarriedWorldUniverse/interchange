@@ -5,12 +5,15 @@
 #
 # Runtime config via env (see cmd/interchange-gateway/main.go):
 #   INTERCHANGE_ADDR, INTERCHANGE_ROUTES, INTERCHANGE_HERALD_ISSUER, INTERCHANGE_AUTH_BYPASS
-FROM docker.io/library/golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26 AS build
+ARG TARGETARCH
+ENV GOTOOLCHAIN=auto
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/interchange-gateway ./cmd/interchange-gateway
+# Cross-compile to the target arch (pure Go, CGO disabled) — fast, no emulation.
+RUN CGO_ENABLED=0 GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/interchange-gateway ./cmd/interchange-gateway
 
 FROM scratch
 # CA certs so heraldauth can fetch JWKS over HTTPS from a real herald issuer.
